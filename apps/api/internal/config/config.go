@@ -1,0 +1,233 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	EnvAddr           = "PLAYGROUND_ADDR"
+	EnvImage          = "PLAYGROUND_OS_IMAGE"
+	EnvQEMUBin        = "PLAYGROUND_QEMU_BIN"
+	EnvVMMemoryMB     = "PLAYGROUND_VM_MEMORY_MB"
+	EnvMaxSessions    = "PLAYGROUND_MAX_SESSIONS"
+	EnvAllowedOrigins = "PLAYGROUND_ALLOWED_ORIGINS"
+	EnvIdleTimeout    = "PLAYGROUND_IDLE_TIMEOUT"
+	EnvMaxDuration    = "PLAYGROUND_MAX_DURATION"
+)
+
+const (
+	defaultAddr        = ":8080"
+	defaultImage       = "build/os.iso"
+	defaultQEMUBin     = "qemu-system-x86_64"
+	defaultVMMemoryMB  = 128
+	defaultMaxSessions = 2
+	defaultIdleTimeout = 15 * time.Minute
+	defaultMaxDuration = time.Hour
+
+	maxVMMemoryMB  = 4096
+	maxMaxSessions = 1000
+)
+
+type Config struct {
+	ListenAddr     string
+	ImagePath      string
+	QEMUBin        string
+	VMMemoryMB     int
+	MaxSessions    int
+	AllowedOrigins []string
+	IdleTimeout    time.Duration
+	MaxDuration    time.Duration
+}
+
+type Lookup func(key string) (value string, ok bool)
+
+func Load(lookup Lookup) (Config, error) {
+	l := loader{lookup: lookup}
+
+	cfg := Config{
+		ListenAddr:  l.str(EnvAddr, defaultAddr),
+		ImagePath:   l.str(EnvImage, defaultImage),
+		QEMUBin:     l.str(EnvQEMUBin, defaultQEMUBin),
+		VMMemoryMB:  l.intInRange(EnvVMMemoryMB, defaultVMMemoryMB, 1, maxVMMemoryMB),
+		MaxSessions: l.intInRange(EnvMaxSessions, defaultMaxSessions, 1, maxMaxSessions),
+	}
+
+	durationsBefore := len(l.errs)
+	cfg.IdleTimeout = l.duration(EnvIdleTimeout, defaultIdleTimeout)
+	cfg.MaxDuration = l.duration(EnvMaxDuration, defaultMaxDuration)
+
+	if len(l.errs) == durationsBefore && cfg.MaxDuration < cfg.IdleTimeout {
+		l.fail(EnvMaxDuration, cfg.MaxDuration.String(),
+			"must not be shorter than "+EnvIdleTimeout)
+	}
+
+	port, addrErr := listenPort(cfg.ListenAddr)
+	if addrErr != nil {
+		l.fail(EnvAddr, cfg.ListenAddr, addrErr.Error())
+	}
+
+	if raw := l.str(EnvAllowedOrigins, ""); raw != "" {
+		origins, err := parseOrigins(raw)
+		if err != nil {
+			l.fail(EnvAllowedOrigins, raw, err.Error())
+		} else {
+			cfg.AllowedOrigins = origins
+		}
+	} else if addrErr == nil {
+		cfg.AllowedOrigins = defaultOrigins(port)
+	}
+
+	if len(l.errs) > 0 {
+		return Config{}, errors.Join(l.errs...)
+	}
+	return cfg, nil
+}
+
+func (c *Config) Validate() error {
+	var errs []error
+
+	if abs, err := filepath.Abs(c.ImagePath); err != nil {
+		errs = append(errs, fmt.Errorf("%s=%q: %w", EnvImage, c.ImagePath, err))
+	} else if err := checkReadableFile(abs); err != nil {
+		errs = append(errs, fmt.Errorf("%s=%q: %w", EnvImage, c.ImagePath, err))
+	} else {
+		c.ImagePath = abs
+	}
+
+	if bin, err := exec.LookPath(c.QEMUBin); err != nil {
+		errs = append(errs, fmt.Errorf("%s=%q: %w", EnvQEMUBin, c.QEMUBin, err))
+	} else {
+		c.QEMUBin = bin
+	}
+
+	return errors.Join(errs...)
+}
+
+func (c Config) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("addr", c.ListenAddr),
+		slog.String("image", c.ImagePath),
+		slog.String("qemu", c.QEMUBin),
+		slog.Int("vm_memory_mb", c.VMMemoryMB),
+		slog.Int("max_sessions", c.MaxSessions),
+		slog.Any("allowed_origins", c.AllowedOrigins),
+		slog.Duration("idle_timeout", c.IdleTimeout),
+		slog.Duration("max_duration", c.MaxDuration),
+	)
+}
+
+func checkReadableFile(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+type loader struct {
+	lookup Lookup
+	errs   []error
+}
+
+func (l *loader) fail(key, raw, msg string) {
+	l.errs = append(l.errs, fmt.Errorf("%s=%q: %s", key, raw, msg))
+}
+
+func (l *loader) str(key, def string) string {
+	if v, ok := l.lookup(key); ok {
+		if v = strings.TrimSpace(v); v != "" {
+			return v
+		}
+	}
+	return def
+}
+
+func (l *loader) intInRange(key string, def, lo, hi int) int {
+	raw := l.str(key, "")
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		l.fail(key, raw, "must be an integer")
+		return def
+	}
+	if n < lo || n > hi {
+		l.fail(key, raw, fmt.Sprintf("must be between %d and %d", lo, hi))
+		return def
+	}
+	return n
+}
+
+func (l *loader) duration(key string, def time.Duration) time.Duration {
+	raw := l.str(key, "")
+	if raw == "" {
+		return def
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		l.fail(key, raw, `must be a duration such as "90s", "15m" or "1h"`)
+		return def
+	}
+	if d <= 0 {
+		l.fail(key, raw, "must be greater than 0")
+		return def
+	}
+	return d
+}
+
+func listenPort(addr string) (int, error) {
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0, fmt.Errorf("must be host:port, for example %q (%v)", ":8080", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, fmt.Errorf("port %q must be a number between 1 and 65535", portStr)
+	}
+	return port, nil
+}
+
+func defaultOrigins(port int) []string {
+	p := strconv.Itoa(port)
+	return []string{"http://localhost:" + p, "http://127.0.0.1:" + p}
+}
+
+func parseOrigins(raw string) ([]string, error) {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		entry := strings.TrimRight(strings.TrimSpace(part), "/")
+		if entry == "" {
+			return nil, errors.New("contains an empty entry")
+		}
+		if entry == "*" {
+			return nil, errors.New(`"*" is not allowed; list explicit origins`)
+		}
+		u, err := url.Parse(entry)
+		if err != nil ||
+			(u.Scheme != "http" && u.Scheme != "https") ||
+			u.Host == "" || u.User != nil ||
+			u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+			return nil, fmt.Errorf("%q is not a valid origin; want http(s)://host[:port]", entry)
+		}
+		out = append(out, strings.ToLower(u.Scheme+"://"+u.Host))
+	}
+	return out, nil
+}
