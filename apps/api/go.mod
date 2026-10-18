@@ -1,4 +1,4 @@
-module github.com/os-playground
+module github.com/os-playground-api
 
 go 1.26.1
 

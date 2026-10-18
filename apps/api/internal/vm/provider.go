@@ -125,7 +125,7 @@ var (
 	// ErrAlreadyAttached: Console was called while another stream is open and
 	// the provider cannot share it. A local QEMU process owns one stdio pair,
 	// so it returns this; handlers must cope with it.
-	ErrALreadyAttached = errors.New("vm: console already attached")
+	ErrAlreadyAttached = errors.New("vm: console already attached")
 )
 
 // Provider creates, observes and destroys VMs.
@@ -145,12 +145,17 @@ type Provider interface {
 
 	// Delete stops the VM and releases everything it holds, including its
 	// capacity slot. It is idempotent: deleting a VM that does not exist
-	// returns nil. After it returns, Get reports ErrNotFound.
+	// returns nil. After it returns, Get reports ErrNotFound. Any console
+	// still attached ends: reads return io.EOF and writes return an error.
 	Delete(ctx context.Context, id string) error
 
 	// Console attaches to the guest's serial console. Reading yields guest
 	// output; writing sends input. Closing the returned stream detaches only
 	// and never stops the VM.
+
+	// When the VM stops, fails or is deleted, an attached stream ends: reads
+	// return io.EOF and writes return an error. This is how callers learn the
+	// VM is gone.
 	//
 	// Output produced while nothing is attached may be buffered or dropped; no
 	// replay is guaranteed. Clients should redraw after attaching.
