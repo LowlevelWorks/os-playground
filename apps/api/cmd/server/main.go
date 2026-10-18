@@ -6,7 +6,7 @@ import (
 	"os"
 
 	"github.com/joho/godotenv"
-	"github.com/os-playground/internal/config"
+	"github.com/os-playground-api/internal/config"
 )
 
 func main() {
