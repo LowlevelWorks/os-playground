@@ -18,7 +18,7 @@ type Server struct {
 // NewServer wires the routes and middleware. allowedOrigins are the full
 // origins (scheme://host[:port]) permitted to call the API; the WebSocket
 // handler uses the host-only form for its own check, derived here.
-func NewServer(manager VMManager, allowedOrigins []string, log *slog.Logger) *Server {
+func NewServer(manager VMManager, allowedOrigins []string, limits RateLimits, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -41,6 +41,7 @@ func NewServer(manager VMManager, allowedOrigins []string, log *slog.Logger) *Se
 
 	// Outermost first: the access log must see what recovery turned a panic into.
 	var h http.Handler = mux
+	h = rateLimit(limits, h)
 	h = cors(allowedOrigins, h)
 	h = recoverPanic(log, h)
 	h = accessLog(log, h)
