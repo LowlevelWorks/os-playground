@@ -2,17 +2,18 @@ name: CI
 
 on:
   push:
-    branches: [main]
-    pull_request:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]   
 
-  permissions:
+permissions:
     contents: read 
 
-  concurrency:
-      group: ci-${{ github.ref}}
+concurrency:
+      group: ci-${{ github.ref }}
       cancel-in-progress: true 
   
-  jobs:
+jobs:
     api:
       runs-on: ubuntu-latest
       timeout-minutes: 15 
@@ -25,7 +26,7 @@ on:
         - uses: actions/setup-go@v5 
           with:
             go-version-file: apps/api/go.md 
-            cache-depedency-path: apps/api/go.sum 
+            cache-dependency-path: apps/api/go.sum 
         
         - run: go mod download 
         - name: go.mod and go.sum are tidy
@@ -50,7 +51,7 @@ on:
           with:
             node-version: 22
             cache: pnpm 
-            cache-depedency-path: apps/web/pnpm-lock.yaml
+            cache-dependency-path: apps/web/pnpm-lock.yaml
         - run: pnpm install --frozen-lockfile
         - run: pnpm typecheck 
         - run: pnpm test 
