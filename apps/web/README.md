@@ -1,3 +1,30 @@
+# os-playground web
+
+## Who can open a machine
+
+The browser makes a random owner token on first visit (32 bytes, base64url,
+in `localStorage` under `os-playground.token`) and sends it with every call:
+`Authorization: Bearer <token>` on REST, and as the WebSocket subprotocol
+`token.<token>` next to `os-playground.v1`, because a browser cannot set
+headers on a WebSocket. The token never goes in a URL.
+
+Only the browser that created a machine can see, attach to or delete it;
+anyone else gets the same 404 as for a machine that does not exist. There are
+no accounts: clearing site data, a private window or another browser is a new
+owner. Its old machine is removed by the server once it has been idle
+(`PLAYGROUND_IDLE_TIMEOUT`, 15 minutes by default).
+
+Each network address may hold `PLAYGROUND_MAX_VMS_PER_CLIENT` machines (1 by
+default). Over that, starting a machine offers "Resume it" when the machine in
+the way is this browser's, and otherwise says someone on the same network is
+using it. The machine's ID is kept in `localStorage` too, so a new tab can
+resume it.
+
+If storage is blocked the token lives in memory only; the page says so,
+because a reload then loses the session.
+
+## Next.js
+
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
 ## Getting Started

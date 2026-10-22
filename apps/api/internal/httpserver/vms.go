@@ -15,15 +15,15 @@ import (
 
 // vmService is what the VM endpoints need.
 type vmService interface {
-	Create(ctx context.Context) (vm.Instance, error)
-	Get(ctx context.Context, id string) (vm.Instance, error)
-	Delete(ctx context.Context, id string) error
+	Create(ctx context.Context, o session.Owner) (vm.Instance, error)
+	Get(ctx context.Context, id string, o session.Owner) (vm.Instance, error)
+	Delete(ctx context.Context, id string, o session.Owner) error
 }
 
 // VMManager is everything the server needs from the session manager.
 type VMManager interface {
 	vmService
-	Console(ctx context.Context, id string) (io.ReadWriteCloser, error)
+	consoleProvider
 }
 
 var _ VMManager = (*session.Manager)(nil)
@@ -42,6 +42,15 @@ func toResponse(v vm.Instance) VMResponse {
 	return VMResponse{ID: v.ID, Status: v.Status, CreatedAt: v.CreatedAt}
 }
 
+// quotaResponse is the 409 body. ID is set only when the VM is the caller's.
+type quotaResponse struct {
+	Error string `json:"error"`
+	Yours bool   `json:"yours"`
+	ID    string `json:"id,omitempty"`
+}
+
+// VMHandler serves the REST endpoints. Its methods take the caller's Owner,
+// so they can only be mounted behind withOwner; see vmRoutes.
 type VMHandler struct {
 	svc vmService
 	log *slog.Logger
@@ -55,10 +64,15 @@ func NewVMHandler(svc vmService, log *slog.Logger) *VMHandler {
 }
 
 // Create handles POST /vms. It takes no body: the server chooses everything.
-func (h *VMHandler) Create(w http.ResponseWriter, r *http.Request) {
-	v, err := h.svc.Create(r.Context())
+func (h *VMHandler) Create(w http.ResponseWriter, r *http.Request, o session.Owner) {
+	v, err := h.svc.Create(r.Context(), o)
+	var quota *session.QuotaError
 	switch {
 	case err == nil:
+	case errors.As(err, &quota):
+		// No Retry-After: waiting does not help, ending a VM does.
+		writeJSON(w, http.StatusConflict, quotaResponse{Error: "quota", Yours: quota.Yours, ID: quota.ID})
+		return
 	case errors.Is(err, vm.ErrCapacity):
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds))
 		writeError(w, http.StatusServiceUnavailable, "no capacity right now; try again shortly")
@@ -75,13 +89,13 @@ func (h *VMHandler) Create(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, toResponse(v))
 }
 
-// Get handles GET /vms/{id}.
-func (h *VMHandler) Get(w http.ResponseWriter, r *http.Request) {
-	v, err := h.svc.Get(r.Context(), r.PathValue("id"))
+// Get handles GET /vms/{id}. Another owner's VM is not found, like no VM.
+func (h *VMHandler) Get(w http.ResponseWriter, r *http.Request, o session.Owner) {
+	v, err := h.svc.Get(r.Context(), r.PathValue("id"), o)
 	switch {
 	case err == nil:
 	case errors.Is(err, vm.ErrNotFound):
-		writeError(w, http.StatusNotFound, "vm not found")
+		vmNotFound(w, r)
 		return
 	case r.Context().Err() != nil:
 		return
@@ -93,12 +107,15 @@ func (h *VMHandler) Get(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toResponse(v))
 }
 
-// Delete handles DELETE /vms/{id}. Deleting a VM that does not exist succeeds.
-func (h *VMHandler) Delete(w http.ResponseWriter, r *http.Request) {
-	err := h.svc.Delete(r.Context(), r.PathValue("id"))
+// Delete handles DELETE /vms/{id}. A VM that is gone or not the caller's is
+// not found, as for Get.
+func (h *VMHandler) Delete(w http.ResponseWriter, r *http.Request, o session.Owner) {
+	err := h.svc.Delete(r.Context(), r.PathValue("id"), o)
 	switch {
 	case err == nil:
 		w.WriteHeader(http.StatusNoContent)
+	case errors.Is(err, vm.ErrNotFound):
+		vmNotFound(w, r)
 	case r.Context().Err() != nil:
 		// The client gave up. The VM is already hidden, and the reaper finishes
 		// the deletion.

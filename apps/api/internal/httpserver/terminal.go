@@ -10,15 +10,18 @@ import (
 	"sync"
 
 	"github.com/coder/websocket"
+	"github.com/os-playground-api/internal/session"
 	"github.com/os-playground-api/internal/terminal"
 	"github.com/os-playground-api/internal/vm"
 )
 
 type consoleProvider interface {
-	Console(ctx context.Context, id string) (io.ReadWriteCloser, error)
+	Console(ctx context.Context, id string, o session.Owner) (io.ReadWriteCloser, error)
 }
 
 // TerminalHandler serves GET /ws/vms/{id}: a WebSocket wired to a VM console.
+// It is not an http.Handler: Serve needs an Owner and admit tracks sessions
+// for Shutdown, and terminalRoute puts the two together.
 type TerminalHandler struct {
 	provider consoleProvider
 	origins  []string
@@ -46,21 +49,34 @@ func NewTerminalHandler(p consoleProvider, origins []string, log *slog.Logger) *
 	}
 }
 
-func (h *TerminalHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !h.enter() {
-		http.Error(w, "shutting down", http.StatusServiceUnavailable)
-		return
-	}
-	defer h.wg.Done()
+// admit counts a request as an open session for Shutdown, or refuses it once
+// Shutdown has begun. It runs before the token is read, so a request during
+// shutdown is told so whatever it carries.
+func (h *TerminalHandler) admit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !h.enter() {
+			http.Error(w, "shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		defer h.wg.Done()
+		next.ServeHTTP(w, r)
+	})
+}
 
+// Serve attaches o to the VM's console. Ownership is checked before Accept,
+// so a refusal is a plain HTTP status.
+func (h *TerminalHandler) Serve(w http.ResponseWriter, r *http.Request, o session.Owner) {
 	id := r.PathValue("id")
-	console, err := h.provider.Console(r.Context(), id)
+	console, err := h.provider.Console(r.Context(), id, o)
 	if err != nil {
 		h.attachFailed(w, r, id, err)
 		return
 	}
 
-	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: h.origins})
+	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		OriginPatterns: h.origins,
+		Subprotocols:   []string{wsProtocol},
+	})
 	if err != nil {
 		console.Close() // frees the single attach slot; Accept already replied
 		return
@@ -87,7 +103,7 @@ func (h *TerminalHandler) enter() bool {
 func (h *TerminalHandler) attachFailed(w http.ResponseWriter, r *http.Request, id string, err error) {
 	switch {
 	case errors.Is(err, vm.ErrNotFound):
-		http.Error(w, "VM not found", http.StatusNotFound)
+		wsNotFound(w, r)
 	case errors.Is(err, vm.ErrNotRunning):
 		http.Error(w, "VM is not running", http.StatusConflict)
 	case errors.Is(err, vm.ErrAlreadyAttached):

@@ -21,8 +21,9 @@ func TestDefaults(t *testing.T) {
 	if cfg.ListenAddr != "127.0.0.1:8080" {
 		t.Errorf("ListenAddr = %q, want loopback only", cfg.ListenAddr)
 	}
-	if cfg.VMMemoryMB != 128 || cfg.MaxSessions != 2 {
-		t.Errorf("memory/sessions = %d/%d, want 128/2", cfg.VMMemoryMB, cfg.MaxSessions)
+	if cfg.VMMemoryMB != 128 || cfg.MaxSessions != 2 || cfg.MaxVMsPerClient != 1 {
+		t.Errorf("memory/sessions/per client = %d/%d/%d, want 128/2/1",
+			cfg.VMMemoryMB, cfg.MaxSessions, cfg.MaxVMsPerClient)
 	}
 	if cfg.IdleTimeout != 15*time.Minute || cfg.MaxDuration != time.Hour {
 		t.Errorf("timeouts = %s/%s", cfg.IdleTimeout, cfg.MaxDuration)
@@ -30,6 +31,18 @@ func TestDefaults(t *testing.T) {
 	if cfg.RateLimitRPS == 0 || cfg.CreateLimitPerMinute == 0 || cfg.TrustedProxyHops != 0 {
 		t.Errorf("rate limits = %d rps, %d creates/min, %d hops; want limits on and no trusted proxy",
 			cfg.RateLimitRPS, cfg.CreateLimitPerMinute, cfg.TrustedProxyHops)
+	}
+}
+
+// The per-client limit may exceed the global one: it then never bites, which
+// is a valid choice for a single-user deployment.
+func TestPerClientLimitIsIndependentOfCapacity(t *testing.T) {
+	cfg, err := Load(env(map[string]string{EnvMaxSessions: "2", EnvMaxPerClient: "5"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MaxVMsPerClient != 5 {
+		t.Fatalf("MaxVMsPerClient = %d, want 5", cfg.MaxVMsPerClient)
 	}
 }
 
@@ -76,6 +89,9 @@ func TestBadValuesAreRejected(t *testing.T) {
 		{"memory not a number", map[string]string{EnvVMMemoryMB: "lots"}, EnvVMMemoryMB},
 		{"memory too big", map[string]string{EnvVMMemoryMB: "999999"}, EnvVMMemoryMB},
 		{"zero sessions", map[string]string{EnvMaxSessions: "0"}, EnvMaxSessions},
+		{"zero per client", map[string]string{EnvMaxPerClient: "0"}, EnvMaxPerClient},
+		{"per client too big", map[string]string{EnvMaxPerClient: "1001"}, EnvMaxPerClient},
+		{"per client not a number", map[string]string{EnvMaxPerClient: "two"}, EnvMaxPerClient},
 		{"bad duration", map[string]string{EnvIdleTimeout: "soon"}, EnvIdleTimeout},
 		{"negative duration", map[string]string{EnvMaxDuration: "-5m"}, EnvMaxDuration},
 		{"max shorter than idle", map[string]string{EnvIdleTimeout: "30m", EnvMaxDuration: "10m"}, EnvMaxDuration},

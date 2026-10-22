@@ -1,4 +1,5 @@
 import { ApiError, type Api, type VM } from "./api";
+import { getToken } from "./token";
 
 /**
  * Where a session is. The UI renders this and nothing else, so every way a
@@ -21,6 +22,8 @@ export type SessionState =
     /** The VM is gone for good: forget it and start a new one. */
     gone?: boolean;
     retryAfterSec?: number;
+    /** A machine of this browser's that is in the way and can be resumed. */
+    resumeId?: string;
   };
 
 /** The part of WebSocket this module uses, so tests can supply a fake. */
@@ -43,12 +46,19 @@ export interface SessionOptions {
   /** Bytes from the guest, in order. */
   onOutput(data: Uint8Array): void;
 
-  openSocket?: (url: string) => SocketLike;
+  /** This browser's owner token; defaults to the stored one. */
+  token?: () => string;
+  /** Opens the console socket, offering these subprotocols. */
+  openSocket?: (url: string, protocols: string[]) => SocketLike;
   pollIntervalMs?: number;
   startTimeoutMs?: number;
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
   now?: () => number;
 }
+
+/** The terminal protocol. The token rides beside it, since a browser cannot set headers on a WebSocket. */
+const WS_PROTOCOL = "os-playground.v1";
+const WS_TOKEN_PREFIX = "token.";
 
 const SOCKET_OPEN = 1;
 const NORMAL_CLOSURE = 1000;
@@ -72,8 +82,10 @@ export class SessionController {
   private readonly startTimeoutMs: number;
   private readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
   private readonly now: () => number;
+  private readonly token: () => string;
 
   private generation = 0;
+  private kind: SessionState["kind"] = "idle";
   private abort: AbortController | null = null;
   private socket: SocketLike | null = null;
   private id: string | null = null;
@@ -84,10 +96,16 @@ export class SessionController {
     this.startTimeoutMs = opts.startTimeoutMs ?? 60_000;
     this.sleep = opts.sleep ?? defaultSleep;
     this.now = opts.now ?? Date.now;
+    this.token = opts.token ?? getToken;
   }
 
-  /** Reserve a new machine, wait for it to boot, and attach. */
+  /**
+   * Reserve a new machine, wait for it to boot, and attach. Does nothing while
+   * a session is already on its way: a second start would abandon the first
+   * machine, which the server would then count against this browser's limit.
+   */
   async start(): Promise<void> {
+    if (this.kind === "creating" || this.kind === "starting" || this.kind === "connecting") return;
     const run = this.begin();
     this.id = null;
     this.set(run, { kind: "creating" });
@@ -153,6 +171,7 @@ export class SessionController {
    */
   dispose(): void {
     this.generation++;
+    this.kind = "idle";
     this.abort?.abort();
     this.abort = null;
     this.closeSocket();
@@ -168,7 +187,9 @@ export class SessionController {
   }
 
   private set(run: Run, state: SessionState): void {
-    if (run.live()) this.opts.onState(state);
+    if (!run.live()) return;
+    this.kind = state.kind;
+    this.opts.onState(state);
   }
 
   private fail(run: Run, err: unknown, id?: string): void {
@@ -226,8 +247,11 @@ export class SessionController {
   private attach(run: Run, id: string): void {
     this.set(run, { kind: "connecting", id });
 
-    const open = this.opts.openSocket ?? ((url: string) => new WebSocket(url));
-    const socket = open(`${this.opts.wsBase}/ws/vms/${encodeURIComponent(id)}`);
+    const open = this.opts.openSocket ?? ((url: string, protocols: string[]) => new WebSocket(url, protocols));
+    const socket = open(`${this.opts.wsBase}/ws/vms/${encodeURIComponent(id)}`, [
+      WS_PROTOCOL,
+      WS_TOKEN_PREFIX + this.token(),
+    ]);
     socket.binaryType = "arraybuffer";
     this.socket = socket;
     let opened = false;
@@ -294,11 +318,25 @@ interface Failure {
   canRetry: boolean;
   gone?: boolean;
   retryAfterSec?: number;
+  resumeId?: string;
 }
 
 /** Turn an error into words a visitor can act on. */
 function describe(err: unknown): Failure {
   if (err instanceof ApiError) {
+    if (err.quota?.yours && err.quota.id) {
+      return { message: "You already have a machine running.", canRetry: false, resumeId: err.quota.id };
+    }
+    if (err.quota?.yours) {
+      // Its create is still in flight, so there is no ID to resume yet.
+      return { message: "Your machine is still starting, try again in a moment.", canRetry: true };
+    }
+    if (err.quota) {
+      return {
+        message: "Someone on your network is using the machine. Try again in a few minutes.",
+        canRetry: true,
+      };
+    }
     if (err.status === 0) {
       return { message: "Can't reach the server. Check that the API is running.", canRetry: true };
     }

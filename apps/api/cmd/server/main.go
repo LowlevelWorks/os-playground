@@ -69,12 +69,13 @@ func run() error {
 	}()
 
 	manager, err := session.New(session.Config{
-		Provider:    provider,
-		Image:       cfg.ImagePath,
-		MemoryMB:    cfg.VMMemoryMB,
-		IdleTimeout: cfg.IdleTimeout,
-		MaxDuration: cfg.MaxDuration,
-		Logger:      log,
+		Provider:     provider,
+		Image:        cfg.ImagePath,
+		MemoryMB:     cfg.VMMemoryMB,
+		MaxPerClient: cfg.MaxVMsPerClient,
+		IdleTimeout:  cfg.IdleTimeout,
+		MaxDuration:  cfg.MaxDuration,
+		Logger:       log,
 	})
 	if err != nil {
 		return err
