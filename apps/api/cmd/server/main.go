@@ -80,7 +80,7 @@ func run() error {
 		return err
 	}
 
-	api := httpserver.NewServer(manager, cfg.OriginHosts(), log)
+	api := httpserver.NewServer(manager, cfg.AllowedOrigins, log)
 	srv := &http.Server{
 		Handler:           api,
 		ReadHeaderTimeout: 5 * time.Second,

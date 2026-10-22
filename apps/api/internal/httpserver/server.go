@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 )
 
 // Server is the HTTP side of the application. It is an http.Handler.
@@ -14,20 +15,25 @@ type Server struct {
 	terminal *TerminalHandler
 }
 
-// NewServer wires the routes and middleware. origins are the host patterns
-// allowed to open a terminal (config.OriginHosts).
-func NewServer(manager VMManager, origins []string, log *slog.Logger) *Server {
+// NewServer wires the routes and middleware. allowedOrigins are the full
+// origins (scheme://host[:port]) permitted to call the API; the WebSocket
+// handler uses the host-only form for its own check, derived here.
+func NewServer(manager VMManager, allowedOrigins []string, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 
 	vms := NewVMHandler(manager, log)
-	terminal := NewTerminalHandler(manager, origins, log)
+	terminal := NewTerminalHandler(manager, originHosts(allowedOrigins), log)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /vms", vms.Create)
 	mux.HandleFunc("GET /vms/{id}", vms.Get)
 	mux.HandleFunc("DELETE /vms/{id}", vms.Delete)
+	// OPTIONS preflight for every /vms* path. The CORS middleware answers it;
+	// without a route the mux would return 405.
+	mux.HandleFunc("OPTIONS /vms", func(w http.ResponseWriter, r *http.Request) {})
+	mux.HandleFunc("OPTIONS /vms/{id}", func(w http.ResponseWriter, r *http.Request) {})
 	mux.Handle("GET /ws/vms/{id}", terminal)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "ok\n")
@@ -35,9 +41,24 @@ func NewServer(manager VMManager, origins []string, log *slog.Logger) *Server {
 
 	// Outermost first: the access log must see what recovery turned a panic into.
 	var h http.Handler = mux
+	h = cors(allowedOrigins, h)
 	h = recoverPanic(log, h)
 	h = accessLog(log, h)
 	return &Server{handler: h, terminal: terminal}
+}
+
+// originHosts returns the host:port part of each origin, which is the form
+// the nhooyr/coder WebSocket matcher expects.
+func originHosts(origins []string) []string {
+	hosts := make([]string, 0, len(origins))
+	for _, o := range origins {
+		u, err := url.Parse(o)
+		if err != nil || u.Host == "" {
+			continue
+		}
+		hosts = append(hosts, u.Host)
+	}
+	return hosts
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.handler.ServeHTTP(w, r) }

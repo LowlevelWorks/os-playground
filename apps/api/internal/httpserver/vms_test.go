@@ -41,7 +41,7 @@ func newAPI(t *testing.T, capacity int) *api {
 		t.Fatalf("session.New: %v", err)
 	}
 	logs := &syncBuffer{}
-	srv := NewServer(m, []string{"localhost:3000"}, slog.New(slog.NewTextHandler(logs, nil)))
+	srv := NewServer(m, []string{"http://localhost:3000"}, slog.New(slog.NewTextHandler(logs, nil)))
 	return &api{t: t, fake: f, srv: srv, logs: logs}
 }
 
