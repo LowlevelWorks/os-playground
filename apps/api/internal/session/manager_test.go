@@ -22,6 +22,14 @@ const (
 	timeout   = 5 * time.Second
 )
 
+// alice and bob share one address; carol is elsewhere. Hashes are opaque to
+// the manager, so short stand-ins do.
+var (
+	alice = Owner{Hash: "aaaa", Client: "203.0.113.1"}
+	bob   = Owner{Hash: "bbbb", Client: "203.0.113.1"}
+	carol = Owner{Hash: "cccc", Client: "198.51.100.7"}
+)
+
 // clock is a hand-driven clock, so no test sleeps.
 type clock struct {
 	mu sync.Mutex
@@ -66,6 +74,8 @@ func newRigOver(t *testing.T, f *fake.Fake, p vm.Provider) *rig {
 		IdleTimeout: idle,
 		MaxDuration: maxLife,
 		Grace:       grace,
+		// Most tests are about lifecycles, not the quota; newQuotaRig sets it.
+		MaxPerClient: 1000,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -85,7 +95,7 @@ func newRigOver(t *testing.T, f *fake.Fake, p vm.Provider) *rig {
 
 func (r *rig) create() string {
 	r.t.Helper()
-	inst, err := r.m.Create(context.Background())
+	inst, err := r.m.Create(context.Background(), alice)
 	if err != nil {
 		r.t.Fatalf("Create: %v", err)
 	}
@@ -94,7 +104,7 @@ func (r *rig) create() string {
 
 func (r *rig) attach(id string) io.ReadWriteCloser {
 	r.t.Helper()
-	c, err := r.m.Console(context.Background(), id)
+	c, err := r.m.Console(context.Background(), id, alice)
 	if err != nil {
 		r.t.Fatalf("Console(%s): %v", id, err)
 	}
@@ -130,7 +140,7 @@ func TestNewRejectsAConfigurationThatWouldDeleteEverything(t *testing.T) {
 	if err == nil {
 		t.Fatal("New(Config{}) = nil, want errors")
 	}
-	for _, want := range []string{"Provider", "Image", "MemoryMB", "IdleTimeout", "MaxDuration"} {
+	for _, want := range []string{"Provider", "Image", "MemoryMB", "MaxPerClient", "IdleTimeout", "MaxDuration"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error does not mention %s: %v", want, err)
 		}
@@ -139,12 +149,12 @@ func TestNewRejectsAConfigurationThatWouldDeleteEverything(t *testing.T) {
 
 func TestCreateChoosesTheSpecItself(t *testing.T) {
 	f := fake.New(fake.WithAutoRun())
-	m, err := New(Config{Provider: f, Image: testImage, MemoryMB: 128, IdleTimeout: idle, MaxDuration: maxLife})
+	m, err := New(Config{Provider: f, Image: testImage, MemoryMB: 128, IdleTimeout: idle, MaxDuration: maxLife, MaxPerClient: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	inst, err := m.Create(context.Background())
+	inst, err := m.Create(context.Background(), alice)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -155,7 +165,7 @@ func TestCreateChoosesTheSpecItself(t *testing.T) {
 	if inst.Image != testImage {
 		t.Errorf("Image = %q, want the configured %q", inst.Image, testImage)
 	}
-	other, _ := m.Create(context.Background())
+	other, _ := m.Create(context.Background(), alice)
 	if other.ID == inst.ID {
 		t.Error("two VMs got the same ID")
 	}
@@ -165,7 +175,7 @@ func TestFailedCreateRegistersNothing(t *testing.T) {
 	r := newRig(t, fake.WithCapacity(1))
 	r.create()
 
-	_, err := r.m.Create(context.Background())
+	_, err := r.m.Create(context.Background(), alice)
 
 	if !errors.Is(err, vm.ErrCapacity) {
 		t.Fatalf("Create = %v, want ErrCapacity", err)
@@ -182,14 +192,14 @@ func TestOnlyVMsTheManagerCreatedAreVisible(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := r.m.Get(context.Background(), "stranger"); !errors.Is(err, vm.ErrNotFound) {
+	if _, err := r.m.Get(context.Background(), "stranger", alice); !errors.Is(err, vm.ErrNotFound) {
 		t.Errorf("Get(stranger) = %v, want ErrNotFound", err)
 	}
-	if _, err := r.m.Console(context.Background(), "stranger"); !errors.Is(err, vm.ErrNotFound) {
+	if _, err := r.m.Console(context.Background(), "stranger", alice); !errors.Is(err, vm.ErrNotFound) {
 		t.Errorf("Console(stranger) = %v, want ErrNotFound", err)
 	}
-	if err := r.m.Delete(context.Background(), "stranger"); err != nil {
-		t.Errorf("Delete(stranger) = %v, want nil", err)
+	if err := r.m.Delete(context.Background(), "stranger", alice); !errors.Is(err, vm.ErrNotFound) {
+		t.Errorf("Delete(stranger) = %v, want ErrNotFound", err)
 	}
 	if !r.vmExists("stranger") {
 		t.Error("the manager deleted a VM it did not create")
@@ -200,18 +210,18 @@ func TestDeleteHidesTheVMAndFreesTheSlot(t *testing.T) {
 	r := newRig(t)
 	id := r.create()
 
-	if err := r.m.Delete(context.Background(), id); err != nil {
+	if err := r.m.Delete(context.Background(), id, alice); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 
-	if _, err := r.m.Get(context.Background(), id); !errors.Is(err, vm.ErrNotFound) {
+	if _, err := r.m.Get(context.Background(), id, alice); !errors.Is(err, vm.ErrNotFound) {
 		t.Errorf("Get after Delete = %v, want ErrNotFound", err)
 	}
 	if r.fake.Len() != 0 {
 		t.Error("the provider still holds the VM")
 	}
-	if err := r.m.Delete(context.Background(), id); err != nil {
-		t.Errorf("second Delete = %v, want nil", err)
+	if err := r.m.Delete(context.Background(), id, alice); !errors.Is(err, vm.ErrNotFound) {
+		t.Errorf("second Delete = %v, want ErrNotFound: the VM is gone", err)
 	}
 }
 
@@ -221,17 +231,17 @@ func TestDeleteRetryAfterAFailedAttemptDoesTheWork(t *testing.T) {
 	r := newRig(t)
 	id := r.create()
 
-	if err := r.m.Delete(cancelled(), id); err == nil {
+	if err := r.m.Delete(cancelled(), id, alice); err == nil {
 		t.Fatal("Delete with a cancelled context = nil, want its error")
 	}
-	if _, err := r.m.Get(context.Background(), id); !errors.Is(err, vm.ErrNotFound) {
+	if _, err := r.m.Get(context.Background(), id, alice); !errors.Is(err, vm.ErrNotFound) {
 		t.Fatalf("Get while deletion is pending = %v, want ErrNotFound", err)
 	}
 	if !r.vmExists(id) {
 		t.Fatal("setup: the VM should still exist after a cancelled Delete")
 	}
 
-	if err := r.m.Delete(context.Background(), id); err != nil {
+	if err := r.m.Delete(context.Background(), id, alice); err != nil {
 		t.Fatalf("retried Delete: %v", err)
 	}
 	if r.vmExists(id) {
@@ -242,7 +252,7 @@ func TestDeleteRetryAfterAFailedAttemptDoesTheWork(t *testing.T) {
 func TestReapFinishesAnAbandonedDelete(t *testing.T) {
 	r := newRig(t)
 	id := r.create()
-	r.m.Delete(cancelled(), id)
+	r.m.Delete(cancelled(), id, alice)
 
 	r.m.Reap(context.Background())
 
@@ -260,7 +270,7 @@ func TestFinishedVMStaysReadableForTheGracePeriod(t *testing.T) {
 
 	r.reapAfter(0) // first seen finished
 	r.reapAfter(grace - time.Second)
-	got, err := r.m.Get(context.Background(), id)
+	got, err := r.m.Get(context.Background(), id, alice)
 	if err != nil || got.Status != vm.StatusFailed {
 		t.Fatalf("inside the grace period: %+v, %v; want the failed VM still readable", got, err)
 	}
@@ -269,7 +279,7 @@ func TestFinishedVMStaysReadableForTheGracePeriod(t *testing.T) {
 	if r.vmExists(id) {
 		t.Fatal("the finished VM survived past the grace period")
 	}
-	if _, err := r.m.Get(context.Background(), id); !errors.Is(err, vm.ErrNotFound) {
+	if _, err := r.m.Get(context.Background(), id, alice); !errors.Is(err, vm.ErrNotFound) {
 		t.Fatalf("Get after removal = %v, want ErrNotFound", err)
 	}
 }
@@ -327,7 +337,7 @@ func TestFailedSecondAttachDoesNotMarkTheVMIdle(t *testing.T) {
 	id := r.create()
 	r.attach(id)
 
-	if _, err := r.m.Console(context.Background(), id); !errors.Is(err, vm.ErrAlreadyAttached) {
+	if _, err := r.m.Console(context.Background(), id, alice); !errors.Is(err, vm.ErrAlreadyAttached) {
 		t.Fatalf("second Console = %v, want ErrAlreadyAttached", err)
 	}
 
@@ -391,7 +401,7 @@ func TestReapCannotRemoveAVMWhoseAttachIsInFlight(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		c, err := r.m.Console(context.Background(), id)
+		c, err := r.m.Console(context.Background(), id, alice)
 		done <- result{c, err}
 	}()
 	<-g.entered // the provider is being asked; the session is not yet marked attached by the provider
@@ -423,16 +433,16 @@ func TestConcurrentUse(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 20; i++ {
-				inst, err := r.m.Create(context.Background())
+				inst, err := r.m.Create(context.Background(), alice)
 				if err != nil {
 					continue
 				}
-				if c, err := r.m.Console(context.Background(), inst.ID); err == nil {
+				if c, err := r.m.Console(context.Background(), inst.ID, alice); err == nil {
 					c.Close()
 				}
-				r.m.Get(context.Background(), inst.ID)
+				r.m.Get(context.Background(), inst.ID, alice)
 				r.m.Reap(context.Background())
-				r.m.Delete(context.Background(), inst.ID)
+				r.m.Delete(context.Background(), inst.ID, alice)
 			}
 		}()
 	}

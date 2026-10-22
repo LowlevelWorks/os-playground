@@ -27,15 +27,30 @@ type api struct {
 	logs *syncBuffer
 }
 
+// Owner tokens for tests: the right length and alphabet, and easy to spot in
+// a log.
+var (
+	tokenA = strings.Repeat("A", tokenLen)
+	tokenB = strings.Repeat("B", tokenLen)
+)
+
+// newAPI allows each client more VMs than capacity, so tests that are not
+// about the quota never meet it. newQuotaAPI sets it.
 func newAPI(t *testing.T, capacity int) *api {
+	t.Helper()
+	return newQuotaAPI(t, capacity, capacity+1)
+}
+
+func newQuotaAPI(t *testing.T, capacity, perClient int) *api {
 	t.Helper()
 	f := fake.New(fake.WithAutoRun(), fake.WithCapacity(capacity))
 	m, err := session.New(session.Config{
-		Provider:    f,
-		Image:       "/secret/images/os.iso",
-		MemoryMB:    128,
-		IdleTimeout: time.Hour,
-		MaxDuration: 2 * time.Hour,
+		Provider:     f,
+		Image:        "/secret/images/os.iso",
+		MemoryMB:     128,
+		MaxPerClient: perClient,
+		IdleTimeout:  time.Hour,
+		MaxDuration:  2 * time.Hour,
 	})
 	if err != nil {
 		t.Fatalf("session.New: %v", err)
@@ -45,9 +60,23 @@ func newAPI(t *testing.T, capacity int) *api {
 	return &api{t: t, fake: f, srv: srv, logs: logs}
 }
 
+// do sends a request as the owner of tokenA.
 func (a *api) do(method, path string) *httptest.ResponseRecorder {
+	return a.doAs(tokenA, "", method, path)
+}
+
+// doAs sends a request with token (none if empty) from remote (the
+// httptest default if empty).
+func (a *api) doAs(token, remote, method, path string) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(method, path, nil)
+	if token != "" {
+		r.Header.Set("Authorization", "Bearer "+token)
+	}
+	if remote != "" {
+		r.RemoteAddr = remote
+	}
 	rec := httptest.NewRecorder()
-	a.srv.ServeHTTP(rec, httptest.NewRequest(method, path, nil))
+	a.srv.ServeHTTP(rec, r)
 	return rec
 }
 
@@ -151,15 +180,15 @@ func TestNoCapacityIs503WithRetryAfter(t *testing.T) {
 	}
 }
 
-func TestDeleteIsIdempotentAndFreesTheSlot(t *testing.T) {
+func TestDeleteFreesTheSlotAndThenTheVMIsGone(t *testing.T) {
 	a := newAPI(t, 1)
 	id := decode(t, a.do("POST", "/vms"))["id"].(string)
 
-	for i := 1; i <= 2; i++ {
-		rec := a.do("DELETE", "/vms/"+id)
-		if rec.Code != http.StatusNoContent || rec.Body.Len() != 0 {
-			t.Fatalf("DELETE #%d = %d with body %q, want 204 and none", i, rec.Code, rec.Body)
-		}
+	if rec := a.do("DELETE", "/vms/"+id); rec.Code != http.StatusNoContent || rec.Body.Len() != 0 {
+		t.Fatalf("DELETE = %d with body %q, want 204 and none", rec.Code, rec.Body)
+	}
+	if rec := a.do("DELETE", "/vms/"+id); rec.Code != http.StatusNotFound {
+		t.Fatalf("second DELETE = %d, want 404", rec.Code)
 	}
 	if rec := a.do("GET", "/vms/"+id); rec.Code != http.StatusNotFound {
 		t.Errorf("GET after DELETE = %d, want 404", rec.Code)
@@ -186,9 +215,13 @@ func TestHealthz(t *testing.T) {
 // brokenVMs fails every call, as a provider with a real fault would.
 type brokenVMs struct{ err error }
 
-func (b brokenVMs) Create(context.Context) (vm.Instance, error)      { return vm.Instance{}, b.err }
-func (b brokenVMs) Get(context.Context, string) (vm.Instance, error) { return vm.Instance{}, b.err }
-func (b brokenVMs) Delete(context.Context, string) error             { return b.err }
+func (b brokenVMs) Create(context.Context, session.Owner) (vm.Instance, error) {
+	return vm.Instance{}, b.err
+}
+func (b brokenVMs) Get(context.Context, string, session.Owner) (vm.Instance, error) {
+	return vm.Instance{}, b.err
+}
+func (b brokenVMs) Delete(context.Context, string, session.Owner) error { return b.err }
 
 // An unexpected failure must never look like success, and must never reach
 // the client in detail. It goes to the log.
@@ -203,12 +236,12 @@ func TestUnexpectedFailuresAre500AndLoggedNotShown(t *testing.T) {
 			var logs syncBuffer
 			h := NewVMHandler(brokenVMs{errors.New("disk on fire")}, slog.New(slog.NewTextHandler(&logs, nil)))
 			mux := http.NewServeMux()
-			mux.HandleFunc("POST /vms", h.Create)
-			mux.HandleFunc("GET /vms/{id}", h.Get)
-			mux.HandleFunc("DELETE /vms/{id}", h.Delete)
+			vmRoutes(mux, h, 0)
 
+			r := httptest.NewRequest(tt.method, tt.path, nil)
+			r.Header.Set("Authorization", "Bearer "+tokenA)
 			rec := httptest.NewRecorder()
-			mux.ServeHTTP(rec, httptest.NewRequest(tt.method, tt.path, nil))
+			mux.ServeHTTP(rec, r)
 
 			if rec.Code != http.StatusInternalServerError {
 				t.Errorf("status = %d, want 500", rec.Code)
@@ -226,7 +259,7 @@ func TestUnexpectedFailuresAre500AndLoggedNotShown(t *testing.T) {
 func TestNewVMHandlerWithoutLoggerDoesNotPanic(t *testing.T) {
 	h := NewVMHandler(brokenVMs{errors.New("boom")}, nil)
 	rec := httptest.NewRecorder()
-	h.Create(rec, httptest.NewRequest("POST", "/vms", nil))
+	h.Create(rec, httptest.NewRequest("POST", "/vms", nil), session.Owner{Hash: hashToken(tokenA)})
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d", rec.Code)
 	}

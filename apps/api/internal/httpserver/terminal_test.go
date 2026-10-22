@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/os-playground-api/internal/session"
 	"github.com/os-playground-api/internal/vm"
 	"github.com/os-playground-api/internal/vm/fake"
 )
@@ -42,8 +43,25 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
+// ownedBy puts an owner check in front of the fake, as the session manager
+// does, so these tests can drive the fake's console directly.
+type ownedBy struct {
+	f    *fake.Fake
+	hash string
+}
+
+func (o ownedBy) Console(ctx context.Context, id string, owner session.Owner) (io.ReadWriteCloser, error) {
+	if owner.Hash != o.hash {
+		return nil, fmt.Errorf("%w: %s", vm.ErrNotFound, id)
+	}
+	return o.f.Console(ctx, id)
+}
+
+// wsOffer is the Sec-WebSocket-Protocol offer the frontend sends.
+func wsOffer(token string) []string { return []string{wsProtocol, wsTokenPrefix + token} }
+
 // env is the handler behind a real HTTP server, in front of the fake provider
-// with one running VM.
+// with one running VM owned by tokenA.
 type env struct {
 	t    *testing.T
 	fake *fake.Fake
@@ -62,9 +80,10 @@ func newEnv(t *testing.T) *env {
 	}
 
 	logs := &syncBuffer{}
-	h := NewTerminalHandler(f, []string{"localhost:3000"}, slog.New(slog.NewTextHandler(logs, nil)))
+	h := NewTerminalHandler(ownedBy{f, hashToken(tokenA)}, []string{"localhost:3000"},
+		slog.New(slog.NewTextHandler(logs, nil)))
 	mux := http.NewServeMux()
-	mux.Handle("GET /ws/vms/{id}", h)
+	terminalRoute(mux, h, 0)
 	srv := httptest.NewServer(mux)
 
 	t.Cleanup(func() {
@@ -82,14 +101,20 @@ func (e *env) url(id string) string {
 	return "ws" + strings.TrimPrefix(e.srv.URL, "http") + "/ws/vms/" + id
 }
 
-// dial opens a terminal. origin may be empty, as for a non-browser client. The
-// response is returned even on failure, so tests can check the status.
+// dial opens a terminal as tokenA's owner. origin may be empty, as for a
+// non-browser client. The response is returned even on failure, so tests can
+// check the status.
 func (e *env) dial(id, origin string) (*websocket.Conn, *http.Response, error) {
+	e.t.Helper()
+	return e.dialOffering(id, origin, wsOffer(tokenA))
+}
+
+func (e *env) dialOffering(id, origin string, protocols []string) (*websocket.Conn, *http.Response, error) {
 	e.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	opts := &websocket.DialOptions{}
+	opts := &websocket.DialOptions{Subprotocols: protocols}
 	if origin != "" {
 		opts.HTTPHeader = http.Header{"Origin": {origin}}
 	}
@@ -187,8 +212,15 @@ func statusOf(resp *http.Response) int {
 // stubProvider fails every attach with a chosen error.
 type stubProvider struct{ err error }
 
-func (s stubProvider) Console(context.Context, string) (io.ReadWriteCloser, error) {
+func (s stubProvider) Console(context.Context, string, session.Owner) (io.ReadWriteCloser, error) {
 	return nil, s.err
+}
+
+// attachRequest is a WebSocket attach request that gets past the token check.
+func attachRequest(id string) *http.Request {
+	r := httptest.NewRequest("GET", "/ws/vms/"+id, nil)
+	r.Header.Set("Sec-WebSocket-Protocol", strings.Join(wsOffer(tokenA), ", "))
+	return r
 }
 
 func TestAttachErrorsBecomeStatusCodes(t *testing.T) {
@@ -208,10 +240,10 @@ func TestAttachErrorsBecomeStatusCodes(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			h := NewTerminalHandler(stubProvider{err: tt.err}, nil, nil)
 			mux := http.NewServeMux()
-			mux.Handle("GET /ws/vms/{id}", h)
+			terminalRoute(mux, h, 0)
 
 			rec := httptest.NewRecorder()
-			mux.ServeHTTP(rec, httptest.NewRequest("GET", "/ws/vms/vm-1", nil))
+			mux.ServeHTTP(rec, attachRequest("vm-1"))
 
 			if rec.Code != tt.want {
 				t.Errorf("status = %d, want %d", rec.Code, tt.want)
@@ -228,10 +260,10 @@ func TestUnexpectedAttachErrorIsLoggedNotShown(t *testing.T) {
 	h := NewTerminalHandler(stubProvider{err: errors.New("disk on fire")}, nil,
 		slog.New(slog.NewTextHandler(&logs, nil)))
 	mux := http.NewServeMux()
-	mux.Handle("GET /ws/vms/{id}", h)
+	terminalRoute(mux, h, 0)
 
 	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/ws/vms/vm-1", nil))
+	mux.ServeHTTP(rec, attachRequest("vm-1"))
 
 	if strings.Contains(rec.Body.String(), "disk on fire") {
 		t.Errorf("response leaks the error: %q", rec.Body.String())
@@ -244,10 +276,10 @@ func TestUnexpectedAttachErrorIsLoggedNotShown(t *testing.T) {
 func TestNewHandlerWithoutLoggerDoesNotPanic(t *testing.T) {
 	h := NewTerminalHandler(stubProvider{err: errors.New("boom")}, nil, nil)
 	mux := http.NewServeMux()
-	mux.Handle("GET /ws/vms/{id}", h)
+	terminalRoute(mux, h, 0)
 
 	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/ws/vms/vm-1", nil)) // logs the 500
+	mux.ServeHTTP(rec, attachRequest("vm-1")) // logs the 500
 
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", rec.Code)
@@ -358,7 +390,11 @@ func TestOriginMustBeAllowed(t *testing.T) {
 func TestFailedUpgradeFreesTheConsole(t *testing.T) {
 	e := newEnv(t)
 
-	resp, err := http.Get(e.srv.URL + "/ws/vms/" + vmID) // a plain request, no upgrade headers
+	// A plain request with the right offer, but no upgrade headers: the
+	// console is attached, then the upgrade fails.
+	req, _ := http.NewRequest("GET", e.srv.URL+"/ws/vms/"+vmID, nil)
+	req.Header.Set("Sec-WebSocket-Protocol", strings.Join(wsOffer(tokenA), ", "))
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -426,7 +462,9 @@ func TestRequestsDuringShutdownDoNotRaceOrLeak(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			resp, err := http.Get(e.srv.URL + "/ws/vms/" + vmID)
+			req, _ := http.NewRequest("GET", e.srv.URL+"/ws/vms/"+vmID, nil)
+			req.Header.Set("Sec-WebSocket-Protocol", strings.Join(wsOffer(tokenA), ", "))
+			resp, err := http.DefaultClient.Do(req)
 			if err == nil {
 				resp.Body.Close()
 			}

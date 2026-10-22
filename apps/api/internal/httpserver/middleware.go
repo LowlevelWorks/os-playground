@@ -44,8 +44,8 @@ func (w *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 func (w *statusRecorder) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // accessLog logs one line per request. It logs the route pattern, never the
-// path: until there is authentication, a VM's ID is the only thing protecting
-// its console, so it must not be written to logs.
+// path or any header: the path holds a VM's ID, and the Authorization and
+// Sec-WebSocket-Protocol headers hold the owner's token.
 func accessLog(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()

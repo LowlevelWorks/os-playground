@@ -1,7 +1,8 @@
 // Package session is the application's record of the VMs it created. It sits
 // between the HTTP handlers and a vm.Provider: it chooses every VM's spec,
 // hides a VM from clients once it is being deleted, and removes VMs that have
-// finished, sat unused, or lived too long.
+// finished, sat unused, or lived too long. Every VM belongs to the Owner that
+// created it, and nobody else can see it.
 //
 // The provider has no List and frees a VM's capacity slot only on Delete, so
 // without this bookkeeping a crashed VM would hold its slot forever.
@@ -10,6 +11,7 @@ package session
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -23,14 +25,39 @@ import (
 
 const defaultGrace = 30 * time.Second
 
+// ErrQuota matches every *QuotaError.
+var ErrQuota = errors.New("session: per-client VM limit reached")
+
+// QuotaError is Create refusing a client that already holds its share.
+type QuotaError struct {
+	// Yours is true when one of those VMs, or a create still in flight,
+	// belongs to the caller's own token.
+	Yours bool
+	// ID is the caller's oldest live VM. It is empty unless Yours, and empty
+	// while the caller's only VM is still being created.
+	ID string
+}
+
+func (e *QuotaError) Error() string        { return ErrQuota.Error() }
+func (e *QuotaError) Is(target error) bool { return target == ErrQuota }
+
+// Owner is who is asking. Hash is the hex SHA-256 of the browser's token, so
+// the manager never holds a token. Client is the network address the quota
+// counts against: several owners can share one.
+type Owner struct {
+	Hash   string
+	Client string
+}
+
 type Config struct {
-	Provider    vm.Provider
-	Image       string // absolute path, already validated by config
-	MemoryMB    int
-	IdleTimeout time.Duration // no browser attached for this long -> delete
-	MaxDuration time.Duration // hard lifetime -> delete
-	Grace       time.Duration // a finished VM stays readable this long; zero means 30s
-	Logger      *slog.Logger  // nil discards
+	Provider     vm.Provider
+	Image        string // absolute path, already validated by config
+	MemoryMB     int
+	MaxPerClient int           // live VMs one Client may hold, counting creates in flight
+	IdleTimeout  time.Duration // no browser attached for this long -> delete
+	MaxDuration  time.Duration // hard lifetime -> delete
+	Grace        time.Duration // a finished VM stays readable this long; zero means 30s
+	Logger       *slog.Logger  // nil discards
 }
 
 // Manager is safe for concurrent use. It never calls the provider while
@@ -39,6 +66,7 @@ type Manager struct {
 	provider         vm.Provider
 	image            string
 	memoryMB         int
+	perClient        int
 	idle, max, grace time.Duration
 	log              *slog.Logger
 
@@ -47,9 +75,12 @@ type Manager struct {
 
 	mu       sync.Mutex
 	sessions map[string]*session
+	pending  map[string]map[string]int // client -> owner hash -> creates in flight
 }
 
 type session struct {
+	owner         string // Owner.Hash
+	client        string // Owner.Client
 	created       time.Time
 	attachers     int       // open consoles, plus attach attempts in flight
 	idleSince     time.Time // when attachers last became 0 (starts at created)
@@ -69,6 +100,9 @@ func New(cfg Config) (*Manager, error) {
 	}
 	if cfg.MemoryMB <= 0 {
 		errs = append(errs, fmt.Errorf("session: MemoryMB=%d: must be greater than 0", cfg.MemoryMB))
+	}
+	if cfg.MaxPerClient <= 0 {
+		errs = append(errs, fmt.Errorf("session: MaxPerClient=%d: must be greater than 0", cfg.MaxPerClient))
 	}
 	if cfg.IdleTimeout <= 0 {
 		errs = append(errs, fmt.Errorf("session: IdleTimeout=%s: must be greater than 0", cfg.IdleTimeout))
@@ -90,21 +124,23 @@ func New(cfg Config) (*Manager, error) {
 		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	return &Manager{
-		provider: cfg.Provider,
-		image:    cfg.Image,
-		memoryMB: cfg.MemoryMB,
-		idle:     cfg.IdleTimeout,
-		max:      cfg.MaxDuration,
-		grace:    cfg.Grace,
-		log:      cfg.Logger,
-		now:      time.Now,
-		newID:    newVMID,
-		sessions: make(map[string]*session),
+		provider:  cfg.Provider,
+		image:     cfg.Image,
+		memoryMB:  cfg.MemoryMB,
+		perClient: cfg.MaxPerClient,
+		idle:      cfg.IdleTimeout,
+		max:       cfg.MaxDuration,
+		grace:     cfg.Grace,
+		log:       cfg.Logger,
+		now:       time.Now,
+		newID:     newVMID,
+		sessions:  make(map[string]*session),
+		pending:   make(map[string]map[string]int),
 	}, nil
 }
 
-// newVMID is the only thing protecting a console until auth exists, so it
-// must be unguessable.
+// newVMID need not be secret, since the owner check guards every VM, but an
+// unguessable ID is a second line of defence.
 func newVMID() string {
 	b := make([]byte, 10)
 	if _, err := rand.Read(b); err != nil {
@@ -113,26 +149,105 @@ func newVMID() string {
 	return "vm-" + hex.EncodeToString(b)
 }
 
-// Create starts a VM. The caller never chooses the ID, image or size. Provider
-// errors come back unchanged, so errors.Is(err, vm.ErrCapacity) works.
-func (m *Manager) Create(ctx context.Context) (vm.Instance, error) {
-	spec := vm.Spec{ID: m.newID(), Image: m.image, MemoryMB: m.memoryMB}
-
-	inst, err := m.provider.Create(ctx, spec)
-	if err != nil {
+// Create starts a VM for o. The caller never chooses the ID, image or size.
+// A client at its limit gets a *QuotaError before the provider is asked;
+// provider errors come back unchanged, so errors.Is(err, vm.ErrCapacity) works.
+//
+// The slot is reserved before the provider is called, because that call can
+// take seconds: without the reservation, concurrent creates from one client
+// would all pass the check. The session is stored in the same critical
+// section that drops the reservation, so the VM is never counted twice or not
+// at all.
+func (m *Manager) Create(ctx context.Context, o Owner) (vm.Instance, error) {
+	m.mu.Lock()
+	if err := m.checkQuota(o); err != nil {
+		m.mu.Unlock()
 		return vm.Instance{}, err
 	}
+	m.reserve(o)
+	m.mu.Unlock()
+
+	spec := vm.Spec{ID: m.newID(), Image: m.image, MemoryMB: m.memoryMB}
+	inst, err := m.provider.Create(ctx, spec)
 
 	now := m.now()
 	m.mu.Lock()
-	m.sessions[inst.ID] = &session{created: now, idleSince: now}
-	m.mu.Unlock()
+	defer m.mu.Unlock()
+	if err == nil {
+		m.sessions[inst.ID] = &session{owner: o.Hash, client: o.Client, created: now, idleSince: now}
+	}
+	m.unreserve(o)
+	if err != nil {
+		return vm.Instance{}, err
+	}
 	return inst, nil
 }
 
-// Get reports a VM the manager created and is not deleting.
-func (m *Manager) Get(ctx context.Context, id string) (vm.Instance, error) {
-	if !m.visible(id) {
+// checkQuota counts o.Client's live VMs and creates in flight. VMs being
+// deleted do not count: they are on their way out. The caller holds m.mu.
+func (m *Manager) checkQuota(o Owner) error {
+	held := 0
+	var oldestID string
+	var oldest time.Time
+	for id, s := range m.sessions {
+		if s.deleting || s.client != o.Client {
+			continue
+		}
+		held++
+		if !owns(s, o) {
+			continue
+		}
+		if oldestID == "" || s.created.Before(oldest) || (s.created.Equal(oldest) && id < oldestID) {
+			oldestID, oldest = id, s.created
+		}
+	}
+	for _, n := range m.pending[o.Client] {
+		held += n
+	}
+	if held < m.perClient {
+		return nil
+	}
+
+	switch {
+	case oldestID != "":
+		return &QuotaError{Yours: true, ID: oldestID}
+	case m.pending[o.Client][o.Hash] > 0:
+		return &QuotaError{Yours: true}
+	default:
+		return &QuotaError{}
+	}
+}
+
+// reserve and unreserve count o's creates in flight. Empty maps are removed so
+// the map does not grow with every client ever seen. The caller holds m.mu.
+func (m *Manager) reserve(o Owner) {
+	byOwner := m.pending[o.Client]
+	if byOwner == nil {
+		byOwner = make(map[string]int)
+		m.pending[o.Client] = byOwner
+	}
+	byOwner[o.Hash]++
+}
+
+func (m *Manager) unreserve(o Owner) {
+	byOwner := m.pending[o.Client]
+	if byOwner[o.Hash]--; byOwner[o.Hash] <= 0 {
+		delete(byOwner, o.Hash)
+	}
+	if len(byOwner) == 0 {
+		delete(m.pending, o.Client)
+	}
+}
+
+// owns compares in constant time. An empty hash owns nothing.
+func owns(s *session, o Owner) bool {
+	return o.Hash != "" && subtle.ConstantTimeCompare([]byte(s.owner), []byte(o.Hash)) == 1
+}
+
+// Get reports a VM that o created and the manager is not deleting. Any other
+// VM, whoever owns it, is ErrNotFound.
+func (m *Manager) Get(ctx context.Context, id string, o Owner) (vm.Instance, error) {
+	if !m.visible(id, o) {
 		return vm.Instance{}, notFound(id)
 	}
 	return m.provider.Get(ctx, id)
@@ -141,10 +256,10 @@ func (m *Manager) Get(ctx context.Context, id string) (vm.Instance, error) {
 // Console attaches to a VM's console. The session counts as in use from before
 // the provider is asked, so Reap cannot delete it as idle in the gap between
 // the provider attaching and this method recording it.
-func (m *Manager) Console(ctx context.Context, id string) (io.ReadWriteCloser, error) {
+func (m *Manager) Console(ctx context.Context, id string, o Owner) (io.ReadWriteCloser, error) {
 	m.mu.Lock()
 	s, ok := m.sessions[id]
-	if !ok || s.deleting {
+	if !ok || s.deleting || !owns(s, o) {
 		m.mu.Unlock()
 		return nil, notFound(id)
 	}
@@ -162,13 +277,14 @@ func (m *Manager) Console(ctx context.Context, id string) (io.ReadWriteCloser, e
 // Delete hides the VM at once and returns when it is really gone. If ctx ends
 // first the VM stays hidden and Reap finishes the deletion. Deleting a VM that
 // is already being deleted calls the provider again: it is idempotent, and a
-// retry after a failed attempt must do real work.
-func (m *Manager) Delete(ctx context.Context, id string) error {
+// retry after a failed attempt must do real work. A VM that is gone, or not
+// o's, is ErrNotFound.
+func (m *Manager) Delete(ctx context.Context, id string, o Owner) error {
 	m.mu.Lock()
 	s, ok := m.sessions[id]
-	if !ok {
+	if !ok || !owns(s, o) {
 		m.mu.Unlock()
-		return nil
+		return notFound(id)
 	}
 	s.deleting = true
 	m.mu.Unlock()
@@ -191,11 +307,11 @@ func (m *Manager) forget(id string) {
 	m.mu.Unlock()
 }
 
-func (m *Manager) visible(id string) bool {
+func (m *Manager) visible(id string, o Owner) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.sessions[id]
-	return ok && !s.deleting
+	return ok && !s.deleting && owns(s, o)
 }
 
 // release gives back one attach reservation. The idle clock restarts when the

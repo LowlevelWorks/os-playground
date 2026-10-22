@@ -20,6 +20,7 @@ const (
 	EnvQEMUBin        = "PLAYGROUND_QEMU_BIN"
 	EnvVMMemoryMB     = "PLAYGROUND_VM_MEMORY_MB"
 	EnvMaxSessions    = "PLAYGROUND_MAX_SESSIONS"
+	EnvMaxPerClient   = "PLAYGROUND_MAX_VMS_PER_CLIENT"
 	EnvAllowedOrigins = "PLAYGROUND_ALLOWED_ORIGINS"
 	EnvIdleTimeout    = "PLAYGROUND_IDLE_TIMEOUT"
 	EnvMaxDuration    = "PLAYGROUND_MAX_DURATION"
@@ -31,16 +32,16 @@ const (
 )
 
 const (
-	// Loopback only: nothing is authenticated yet, so the server must not be
-	// reachable from other machines unless someone asks for that explicitly
-	// with PLAYGROUND_ADDR.
-	defaultAddr        = "127.0.0.1:8080"
-	defaultImage       = "build/os.iso"
-	defaultQEMUBin     = "qemu-system-x86_64"
-	defaultVMMemoryMB  = 128
-	defaultMaxSessions = 2
-	defaultIdleTimeout = 15 * time.Minute
-	defaultMaxDuration = time.Hour
+	// Loopback only, so the server is reachable from other machines only when
+	// someone asks for that explicitly with PLAYGROUND_ADDR.
+	defaultAddr         = "127.0.0.1:8080"
+	defaultImage        = "build/os.iso"
+	defaultQEMUBin      = "qemu-system-x86_64"
+	defaultVMMemoryMB   = 128
+	defaultMaxSessions  = 2
+	defaultMaxPerClient = 1
+	defaultIdleTimeout  = 15 * time.Minute
+	defaultMaxDuration  = time.Hour
 
 	// Per client. The frontend polls at 2 requests a second while a VM boots.
 	defaultRateLimitRPS         = 10
@@ -59,8 +60,10 @@ type Config struct {
 	QEMUBin    string
 	VMMemoryMB int
 
-	// MaxSessions is how many VMs may exist at once.
-	MaxSessions int
+	// MaxSessions is how many VMs may exist at once. MaxVMsPerClient is how
+	// many of them one client (see TrustedProxyHops) may hold.
+	MaxSessions     int
+	MaxVMsPerClient int
 
 	// AllowedOrigins are the web pages allowed to open a terminal, as full
 	// origins: scheme://host[:port]. Use OriginHosts for the WebSocket handler.
@@ -95,6 +98,8 @@ func Load(lookup Lookup) (Config, error) {
 		QEMUBin:     l.str(EnvQEMUBin, defaultQEMUBin),
 		VMMemoryMB:  l.intInRange(EnvVMMemoryMB, defaultVMMemoryMB, 1, maxVMMemoryMB),
 		MaxSessions: l.intInRange(EnvMaxSessions, defaultMaxSessions, 1, maxMaxSessions),
+
+		MaxVMsPerClient: l.intInRange(EnvMaxPerClient, defaultMaxPerClient, 1, maxMaxSessions),
 
 		RateLimitRPS:         l.intInRange(EnvRateLimitRPS, defaultRateLimitRPS, 0, maxRateLimit),
 		RateLimitBurst:       l.intInRange(EnvRateLimitBurst, defaultRateLimitBurst, 0, maxRateLimit),
@@ -180,6 +185,7 @@ func (c Config) LogValue() slog.Value {
 		slog.String("qemu", c.QEMUBin),
 		slog.Int("vm_memory_mb", c.VMMemoryMB),
 		slog.Int("max_sessions", c.MaxSessions),
+		slog.Int("max_vms_per_client", c.MaxVMsPerClient),
 		slog.Any("allowed_origins", c.AllowedOrigins),
 		slog.Duration("idle_timeout", c.IdleTimeout),
 		slog.Duration("max_duration", c.MaxDuration),

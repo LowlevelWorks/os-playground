@@ -1,18 +1,21 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { createApi } from "@/lib/api";
 import { API_BASE, ENTER_AS_LF, wsBase } from "@/lib/config";
 import { SessionController, type SessionState } from "@/lib/session";
+import { tokenPersisted } from "@/lib/token";
 import { BootRail, type LampState, type Stage } from "./BootRail";
 import { TerminalView, type TerminalHandle } from "./TerminalView";
 
+// In localStorage, not sessionStorage, so a new tab can offer to resume too.
+// Only this browser's token can open the machine, so the ID is no secret.
 const STORAGE_KEY = "os-playground.vm";
 
 function store(id: string | null) {
     try {
-        if (id) sessionStorage.setItem(STORAGE_KEY, id);
-        else sessionStorage.removeItem(STORAGE_KEY);
+        if (id) localStorage.setItem(STORAGE_KEY, id);
+        else localStorage.removeItem(STORAGE_KEY);
     } catch {
         /* storage can be blocked; resuming is a convenience only */
     }
@@ -20,11 +23,13 @@ function store(id: string | null) {
 
 function stored(): string | null {
     try {
-        return sessionStorage.getItem(STORAGE_KEY);
+        return localStorage.getItem(STORAGE_KEY);
     } catch {
         return null;
     }
 }
+
+const noSubscription = () => () => {};
 
 type StageIndex = 0 | 1 | 2 | 3;
 
@@ -63,7 +68,7 @@ function stages(state: SessionState, lastStage: StageIndex): Stage[] {
 function statusLine(s: SessionState, resumable: boolean): string {
     switch (s.kind) {
         case "idle":
-            return resumable ? "A session from this tab is still running." : "No machine running.";
+            return resumable ? "A session from this browser is still running." : "No machine running.";
         case "creating":
             return "Reserving a machine…";
         case "starting":
@@ -89,6 +94,13 @@ export function Playground() {
 
     const [state, setState] = useState<SessionState>({ kind: "idle" });
     const [resumeId, setResumeId] = useState<string | null>(null);
+    // Storage does not exist during the static build, so the server snapshot
+    // assumes it works; the browser's answer never changes after the first read.
+    const storageBlocked = useSyncExternalStore(
+        noSubscription,
+        () => !tokenPersisted(),
+        () => false,
+    );
 
     useEffect(() => {
         const api = createApi(API_BASE);
@@ -160,7 +172,9 @@ export function Playground() {
     const live = state.kind === "live";
     const isError = state.kind === "error";
     const canRetry = isError && state.canRetry;
-    const showStart = state.kind === "idle" || state.kind === "ended" || (isError && !state.canRetry);
+    const resumeMine = isError ? state.resumeId : undefined;
+    const showStart =
+        state.kind === "idle" || state.kind === "ended" || (isError && !state.canRetry && !resumeMine);
 
     return (
         <section className="machine" data-state={state.kind} aria-label="Machine">
@@ -169,6 +183,11 @@ export function Playground() {
                 <p className="status" role="status" aria-live="polite" data-tone={isError ? "error" : undefined}>
                     {statusLine(state, resumeId !== null)}
                 </p>
+                {storageBlocked && (
+                    <p className="status" data-tone="error">
+                        Your browser is blocking storage, so a reload will lose this session.
+                    </p>
+                )}
             </div>
 
             <div className="screen">
@@ -189,6 +208,11 @@ export function Playground() {
                 {state.kind === "idle" && resumeId && (
                     <button type="button" className="btn" onClick={resume}>
                         Resume session
+                    </button>
+                )}
+                {resumeMine && (
+                    <button type="button" className="btn primary" onClick={resume2(resumeMine)}>
+                        Resume it
                     </button>
                 )}
                 {canRetry && (

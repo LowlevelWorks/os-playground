@@ -4,6 +4,8 @@ import { SessionController, type SessionState, type SocketLike } from "./session
 
 const vm = (status: VMStatus, id = "vm-1"): VM => ({ id, status, created_at: "" });
 
+const TOKEN = "T".repeat(43);
+
 class FakeSocket implements SocketLike {
   binaryType = "blob";
   readyState = 0;
@@ -14,7 +16,7 @@ class FakeSocket implements SocketLike {
   sent: number[][] = [];
   closedWith: { code?: number; reason?: string } | null = null;
 
-  constructor(readonly url: string) { }
+  constructor(readonly url: string, readonly protocols: string[] = []) { }
 
   send(data: Uint8Array<ArrayBuffer>) {
     this.sent.push([...data]);
@@ -56,8 +58,9 @@ function setup(over: { api?: Partial<Api>; startTimeoutMs?: number; sleep?: () =
     wsBase: "ws://api.test",
     onState: (s) => states.push(s),
     onOutput: (d) => output.push([...d]),
-    openSocket: (url) => {
-      const s = new FakeSocket(url);
+    token: () => TOKEN,
+    openSocket: (url, protocols) => {
+      const s = new FakeSocket(url, protocols);
       sockets.push(s);
       return s;
     },
@@ -77,6 +80,8 @@ describe("starting a session", () => {
     await t.controller.start();
     expect(t.kinds()).toEqual(["creating", "starting", "connecting"]);
     expect(t.sockets[0].url).toBe("ws://api.test/ws/vms/vm-1");
+    expect(t.sockets[0].url).not.toContain(TOKEN);
+    expect(t.sockets[0].protocols).toEqual(["os-playground.v1", `token.${TOKEN}`]);
     expect(t.sockets[0].binaryType).toBe("arraybuffer");
 
     t.sockets[0].open();
@@ -157,13 +162,12 @@ describe("starting a session", () => {
     });
   });
 
-  it("supersedes an earlier start whose answer arrives late", async () => {
+  // A second start would abandon the first machine, which would then hold
+  // this browser's only slot until the server reaped it.
+  it("ignores a second start while the first is still on its way", async () => {
     let release!: (v: VM) => void;
     const slow = new Promise<VM>((r) => (release = r));
-    const createVM = vi
-      .fn<Api["createVM"]>()
-      .mockReturnValueOnce(slow)
-      .mockResolvedValueOnce(vm("running", "vm-2"));
+    const createVM = vi.fn<Api["createVM"]>().mockReturnValueOnce(slow);
     const t = setup({ api: { createVM } });
 
     const first = t.controller.start();
@@ -171,8 +175,68 @@ describe("starting a session", () => {
     release(vm("running", "vm-1"));
     await first;
 
+    expect(createVM).toHaveBeenCalledTimes(1);
     expect(t.sockets).toHaveLength(1);
+    expect(t.sockets[0].url).toContain("vm-1");
+  });
+
+  it("can start again once the first start has failed", async () => {
+    const createVM = vi
+      .fn<Api["createVM"]>()
+      .mockRejectedValueOnce(new ApiError(503, "busy", 5))
+      .mockResolvedValueOnce(vm("running", "vm-2"));
+    const t = setup({ api: { createVM } });
+
+    await t.controller.start();
+    await t.controller.start();
+
+    expect(createVM).toHaveBeenCalledTimes(2);
     expect(t.sockets[0].url).toContain("vm-2");
+  });
+
+  it("offers to resume this browser's machine when it is over the limit", async () => {
+    const t = setup({
+      api: { createVM: async () => { throw new ApiError(409, "quota", undefined, { yours: true, id: "vm-7" }); } },
+    });
+
+    await t.controller.start();
+
+    expect(last(t.states)).toEqual({
+      kind: "error",
+      message: "You already have a machine running.",
+      canRetry: false,
+      resumeId: "vm-7",
+    });
+  });
+
+  it("says to wait when this browser's own machine is still being created", async () => {
+    const t = setup({
+      api: { createVM: async () => { throw new ApiError(409, "quota", undefined, { yours: true }); } },
+    });
+
+    await t.controller.start();
+
+    expect(last(t.states)).toMatchObject({
+      kind: "error",
+      canRetry: true,
+      message: "Your machine is still starting, try again in a moment.",
+    });
+    expect(last(t.states)).not.toHaveProperty("resumeId");
+  });
+
+  it("explains that someone else on the network holds the machine", async () => {
+    const t = setup({
+      api: { createVM: async () => { throw new ApiError(409, "quota", undefined, { yours: false }); } },
+    });
+
+    await t.controller.start();
+
+    expect(last(t.states)).toMatchObject({
+      kind: "error",
+      canRetry: true,
+      message: "Someone on your network is using the machine. Try again in a few minutes.",
+    });
+    expect(last(t.states)).not.toHaveProperty("resumeId");
   });
 });
 
@@ -245,6 +309,23 @@ describe("the console", () => {
 });
 
 describe("resuming", () => {
+  it("resumes the machine a quota refusal pointed at", async () => {
+    const t = setup({
+      api: {
+        createVM: async () => { throw new ApiError(409, "quota", undefined, { yours: true, id: "vm-7" }); },
+        getVM: async (id) => vm("running", id),
+      },
+    });
+    await t.controller.start();
+    const { resumeId } = last(t.states) as { resumeId: string };
+
+    await t.controller.resume(resumeId);
+    t.sockets[0].open();
+
+    expect(t.sockets[0].url).toContain("vm-7");
+    expect(last(t.states)).toEqual({ kind: "live", id: "vm-7" });
+  });
+
   it("attaches without creating anything", async () => {
     const t = setup({ api: { getVM: async (id) => vm("running", id) } });
 
