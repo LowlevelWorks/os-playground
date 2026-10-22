@@ -23,6 +23,11 @@ const (
 	EnvAllowedOrigins = "PLAYGROUND_ALLOWED_ORIGINS"
 	EnvIdleTimeout    = "PLAYGROUND_IDLE_TIMEOUT"
 	EnvMaxDuration    = "PLAYGROUND_MAX_DURATION"
+
+	EnvRateLimitRPS         = "PLAYGROUND_RATE_LIMIT_RPS"
+	EnvRateLimitBurst       = "PLAYGROUND_RATE_LIMIT_BURST"
+	EnvCreateLimitPerMinute = "PLAYGROUND_CREATE_LIMIT_PER_MINUTE"
+	EnvTrustedProxyHops     = "PLAYGROUND_TRUSTED_PROXY_HOPS"
 )
 
 const (
@@ -37,8 +42,15 @@ const (
 	defaultIdleTimeout = 15 * time.Minute
 	defaultMaxDuration = time.Hour
 
+	// Per client. The frontend polls at 2 requests a second while a VM boots.
+	defaultRateLimitRPS         = 10
+	defaultRateLimitBurst       = 40
+	defaultCreateLimitPerMinute = 5
+
 	maxVMMemoryMB  = 4096
 	maxMaxSessions = 1000
+	maxRateLimit   = 100_000
+	maxProxyHops   = 10
 )
 
 type Config struct {
@@ -58,6 +70,16 @@ type Config struct {
 	// removed. MaxDuration is the longest any VM may live.
 	IdleTimeout time.Duration
 	MaxDuration time.Duration
+
+	// Per-client rate limits; 0 turns one off. CreateLimitPerMinute applies
+	// to starting VMs on top of the general limit.
+	RateLimitRPS         int
+	RateLimitBurst       int
+	CreateLimitPerMinute int
+
+	// TrustedProxyHops is how many reverse proxies append to X-Forwarded-For.
+	// 0 ignores the header and limits by the TCP peer address.
+	TrustedProxyHops int
 }
 
 type Lookup func(key string) (value string, ok bool)
@@ -73,6 +95,16 @@ func Load(lookup Lookup) (Config, error) {
 		QEMUBin:     l.str(EnvQEMUBin, defaultQEMUBin),
 		VMMemoryMB:  l.intInRange(EnvVMMemoryMB, defaultVMMemoryMB, 1, maxVMMemoryMB),
 		MaxSessions: l.intInRange(EnvMaxSessions, defaultMaxSessions, 1, maxMaxSessions),
+
+		RateLimitRPS:         l.intInRange(EnvRateLimitRPS, defaultRateLimitRPS, 0, maxRateLimit),
+		RateLimitBurst:       l.intInRange(EnvRateLimitBurst, defaultRateLimitBurst, 0, maxRateLimit),
+		CreateLimitPerMinute: l.intInRange(EnvCreateLimitPerMinute, defaultCreateLimitPerMinute, 0, maxRateLimit),
+		TrustedProxyHops:     l.intInRange(EnvTrustedProxyHops, 0, 0, maxProxyHops),
+	}
+
+	if (cfg.RateLimitRPS == 0) != (cfg.RateLimitBurst == 0) {
+		l.fail(EnvRateLimitBurst, strconv.Itoa(cfg.RateLimitBurst),
+			"must be 0 exactly when "+EnvRateLimitRPS+" is 0")
 	}
 
 	durationsBefore := len(l.errs)
@@ -151,6 +183,10 @@ func (c Config) LogValue() slog.Value {
 		slog.Any("allowed_origins", c.AllowedOrigins),
 		slog.Duration("idle_timeout", c.IdleTimeout),
 		slog.Duration("max_duration", c.MaxDuration),
+		slog.Int("rate_limit_rps", c.RateLimitRPS),
+		slog.Int("rate_limit_burst", c.RateLimitBurst),
+		slog.Int("create_limit_per_minute", c.CreateLimitPerMinute),
+		slog.Int("trusted_proxy_hops", c.TrustedProxyHops),
 	)
 }
 

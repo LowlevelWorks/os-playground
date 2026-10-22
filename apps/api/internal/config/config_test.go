@@ -27,6 +27,10 @@ func TestDefaults(t *testing.T) {
 	if cfg.IdleTimeout != 15*time.Minute || cfg.MaxDuration != time.Hour {
 		t.Errorf("timeouts = %s/%s", cfg.IdleTimeout, cfg.MaxDuration)
 	}
+	if cfg.RateLimitRPS == 0 || cfg.CreateLimitPerMinute == 0 || cfg.TrustedProxyHops != 0 {
+		t.Errorf("rate limits = %d rps, %d creates/min, %d hops; want limits on and no trusted proxy",
+			cfg.RateLimitRPS, cfg.CreateLimitPerMinute, cfg.TrustedProxyHops)
+	}
 }
 
 func TestDefaultOriginsAreTheDevFrontend(t *testing.T) {
@@ -75,6 +79,9 @@ func TestBadValuesAreRejected(t *testing.T) {
 		{"bad duration", map[string]string{EnvIdleTimeout: "soon"}, EnvIdleTimeout},
 		{"negative duration", map[string]string{EnvMaxDuration: "-5m"}, EnvMaxDuration},
 		{"max shorter than idle", map[string]string{EnvIdleTimeout: "30m", EnvMaxDuration: "10m"}, EnvMaxDuration},
+		{"negative rate limit", map[string]string{EnvRateLimitRPS: "-1"}, EnvRateLimitRPS},
+		{"rate without burst", map[string]string{EnvRateLimitBurst: "0"}, EnvRateLimitBurst},
+		{"too many proxy hops", map[string]string{EnvTrustedProxyHops: "99"}, EnvTrustedProxyHops},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
