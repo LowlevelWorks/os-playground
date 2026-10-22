@@ -26,7 +26,10 @@ const (
 )
 
 const (
-	defaultAddr        = ":8080"
+	// Loopback only: nothing is authenticated yet, so the server must not be
+	// reachable from other machines unless someone asks for that explicitly
+	// with PLAYGROUND_ADDR.
+	defaultAddr        = "127.0.0.1:8080"
 	defaultImage       = "build/os.iso"
 	defaultQEMUBin     = "qemu-system-x86_64"
 	defaultVMMemoryMB  = 128
@@ -39,18 +42,28 @@ const (
 )
 
 type Config struct {
-	ListenAddr     string
-	ImagePath      string
-	QEMUBin        string
-	VMMemoryMB     int
-	MaxSessions    int
+	ListenAddr string
+	ImagePath  string
+	QEMUBin    string
+	VMMemoryMB int
+
+	// MaxSessions is how many VMs may exist at once.
+	MaxSessions int
+
+	// AllowedOrigins are the web pages allowed to open a terminal, as full
+	// origins: scheme://host[:port]. Use OriginHosts for the WebSocket handler.
 	AllowedOrigins []string
-	IdleTimeout    time.Duration
-	MaxDuration    time.Duration
+
+	// IdleTimeout is how long a VM may have no browser attached before it is
+	// removed. MaxDuration is the longest any VM may live.
+	IdleTimeout time.Duration
+	MaxDuration time.Duration
 }
 
 type Lookup func(key string) (value string, ok bool)
 
+// Load reads the configuration and reports every problem at once. It does not
+// touch the file system: call Validate for that.
 func Load(lookup Lookup) (Config, error) {
 	l := loader{lookup: lookup}
 
@@ -71,9 +84,8 @@ func Load(lookup Lookup) (Config, error) {
 			"must not be shorter than "+EnvIdleTimeout)
 	}
 
-	port, addrErr := listenPort(cfg.ListenAddr)
-	if addrErr != nil {
-		l.fail(EnvAddr, cfg.ListenAddr, addrErr.Error())
+	if err := checkListenAddr(cfg.ListenAddr); err != nil {
+		l.fail(EnvAddr, cfg.ListenAddr, err.Error())
 	}
 
 	if raw := l.str(EnvAllowedOrigins, ""); raw != "" {
@@ -83,8 +95,8 @@ func Load(lookup Lookup) (Config, error) {
 		} else {
 			cfg.AllowedOrigins = origins
 		}
-	} else if addrErr == nil {
-		cfg.AllowedOrigins = defaultOrigins(port)
+	} else {
+		cfg.AllowedOrigins = defaultOrigins()
 	}
 
 	if len(l.errs) > 0 {
@@ -93,6 +105,9 @@ func Load(lookup Lookup) (Config, error) {
 	return cfg, nil
 }
 
+// Validate checks the things Load cannot: that the image and QEMU exist. It
+// replaces ImagePath with an absolute path and QEMUBin with the resolved
+// executable, so call it before using either.
 func (c *Config) Validate() error {
 	var errs []error
 
@@ -111,6 +126,19 @@ func (c *Config) Validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// OriginHosts returns AllowedOrigins as host patterns ("localhost:3000"),
+// which is the form the WebSocket handler matches a browser's Origin against.
+// The scheme is not part of that match.
+func (c Config) OriginHosts() []string {
+	hosts := make([]string, 0, len(c.AllowedOrigins))
+	for _, o := range c.AllowedOrigins {
+		if u, err := url.Parse(o); err == nil { // already validated by parseOrigins
+			hosts = append(hosts, u.Host)
+		}
+	}
+	return hosts
 }
 
 func (c Config) LogValue() slog.Value {
@@ -193,21 +221,22 @@ func (l *loader) duration(key string, def time.Duration) time.Duration {
 	return d
 }
 
-func listenPort(addr string) (int, error) {
+func checkListenAddr(addr string) error {
 	_, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
-		return 0, fmt.Errorf("must be host:port, for example %q (%v)", ":8080", err)
+		return fmt.Errorf("must be host:port, for example %q (%v)", defaultAddr, err)
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil || port < 1 || port > 65535 {
-		return 0, fmt.Errorf("port %q must be a number between 1 and 65535", portStr)
+		return fmt.Errorf("port %q must be a number between 1 and 65535", portStr)
 	}
-	return port, nil
+	return nil
 }
 
-func defaultOrigins(port int) []string {
-	p := strconv.Itoa(port)
-	return []string{"http://localhost:" + p, "http://127.0.0.1:" + p}
+// defaultOrigins are the Next.js dev server's addresses. The API's own origin
+// needs no entry: same-origin requests are always allowed.
+func defaultOrigins() []string {
+	return []string{"http://localhost:3000", "http://127.0.0.1:3000"}
 }
 
 func parseOrigins(raw string) ([]string, error) {
