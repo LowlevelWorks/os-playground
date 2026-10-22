@@ -89,11 +89,11 @@ function statusLine(s: SessionState, resumable: boolean): string {
 export function Playground() {
     const termRef = useRef<TerminalHandle>(null);
     const controllerRef = useRef<SessionController | null>(null);
-    const lastStage = useRef<StageIndex>(0);
     const encoder = useMemo(() => new TextEncoder(), []);
 
     const [state, setState] = useState<SessionState>({ kind: "idle" });
     const [resumeId, setResumeId] = useState<string | null>(null);
+    const [lastStage, setLastStage] = useState<StageIndex>(0);
     // Storage does not exist during the static build, so the server snapshot
     // assumes it works; the browser's answer never changes after the first read.
     const storageBlocked = useSyncExternalStore(
@@ -112,7 +112,7 @@ export function Playground() {
             onOutput: (data) => termRef.current?.write(data),
             onState: (s) => {
                 const idx = stageOf(s);
-                if (idx !== null) lastStage.current = idx;
+                if (idx !== null) setLastStage(idx);
 
                 if (s.kind === "starting" || s.kind === "connecting" || s.kind === "live") {
                     store(s.id);
@@ -179,7 +179,7 @@ export function Playground() {
     return (
         <section className="machine" data-state={state.kind} aria-label="Machine">
             <div className="panel">
-                <BootRail stages={stages(state, lastStage.current)} />
+                <BootRail stages={stages(state, lastStage)} />
                 <p className="status" role="status" aria-live="polite" data-tone={isError ? "error" : undefined}>
                     {statusLine(state, resumeId !== null)}
                 </p>
