@@ -1,0 +1,61 @@
+name: CI 
+
+on:
+  push:
+    branches: [main]
+    pull_request:
+
+  permissions:
+    contents: read 
+
+  concurrency:
+      group: ci-${{ github.ref}}
+      cancel-in-progress: true 
+  
+  jobs:
+    api:
+      runs-on: ubuntu-latest
+      timeout-minutes: 15 
+      defaults:
+        run:
+          working-directory: apps/api 
+
+      steps:
+        - uses: actions/checkout@v4 
+        - uses: actions/setup-go@v5 
+          with:
+            go-version-file: apps/api/go.md 
+            cache-depedency-path: apps/api/go.sum 
+        
+        - run: go mod download 
+        - name: go.mod and go.sum are tidy
+          run: go mod tidy && git diff --exit-code go.mod go.sum 
+        - run: make lint 
+        - run: make test 
+        - run: make build
+
+
+    web:
+      runs-on: ubuntu-latest 
+      timeout-minutes: 15 
+      defaults:
+        run:
+          working-directory: apps/web 
+      steps:
+        - uses: actions/checkout@v4 
+        - uses: pnpm/action-setup@v4 
+          with:
+            package_json_file: apps/web/package.json 
+        - uses: actions/setup-node@v4
+          with:
+            node-version: 22
+            cache: pnpm 
+            cache-depedency-path: apps/web/pnpm-lock.yaml
+        - run: pnpm install --frozen-lockfile
+        - run: pnpm typecheck 
+        - run: pnpm test 
+        - run: pnpm build 
+        - run: pnpm lint
+
+
+
