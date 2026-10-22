@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"runtime/debug"
+	"strings"
 	"time"
 )
 
@@ -61,6 +62,39 @@ func accessLog(log *slog.Logger, next http.Handler) http.Handler {
 			"status", rec.status,
 			"duration", time.Since(start),
 		)
+	})
+}
+
+// cors emits CORS headers for the REST endpoints. The frontend is a static
+// bundle served from a different origin (CloudFront in production, Next.js in
+// dev), so same-origin isn't available; browsers block the response body
+// unless Access-Control-Allow-Origin matches. WebSocket upgrades negotiate
+// their own origin check and bypass this.
+func cors(allowed []string, next http.Handler) http.Handler {
+	set := make(map[string]struct{}, len(allowed))
+	for _, o := range allowed {
+		set[strings.ToLower(o)] = struct{}{}
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if origin := r.Header.Get("Origin"); origin != "" {
+			if _, ok := set[strings.ToLower(origin)]; ok {
+				h := w.Header()
+				h.Set("Access-Control-Allow-Origin", origin)
+				h.Add("Vary", "Origin")
+				if r.Method == http.MethodOptions {
+					if m := r.Header.Get("Access-Control-Request-Method"); m != "" {
+						h.Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+					}
+					if hdrs := r.Header.Get("Access-Control-Request-Headers"); hdrs != "" {
+						h.Set("Access-Control-Allow-Headers", hdrs)
+					}
+					h.Set("Access-Control-Max-Age", "600")
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
