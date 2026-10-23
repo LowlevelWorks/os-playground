@@ -28,12 +28,16 @@ func validToken(s string) bool {
 		return false
 	}
 	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if !('A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '-' || c == '_') {
+		if !isTokenChar(s[i]) {
 			return false
 		}
 	}
 	return true
+}
+
+// isTokenChar reports whether c is in the base64url alphabet.
+func isTokenChar(c byte) bool {
+	return 'A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '-' || c == '_'
 }
 
 func hashToken(token string) string {

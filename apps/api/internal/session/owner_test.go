@@ -309,7 +309,10 @@ func TestDeletingFreesTheSlot(t *testing.T) {
 func TestAVMBeingDeletedDoesNotCount(t *testing.T) {
 	r := newQuotaRig(t, 1)
 	id := r.mustCreateAs(alice)
-	r.m.Delete(cancelled(), id, alice) // hidden, still alive
+	// Hidden, still alive: the cancelled ctx abandons the delete part-way.
+	if err := r.m.Delete(cancelled(), id, alice); !errors.Is(err, context.Canceled) {
+		t.Fatalf("setup: Delete with a cancelled ctx = %v, want context.Canceled", err)
+	}
 
 	if !r.vmExists(id) {
 		t.Fatal("setup: the VM should still exist")

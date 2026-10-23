@@ -61,6 +61,7 @@ func TestAbortHandlerIsNotSwallowed(t *testing.T) {
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { panic(http.ErrAbortHandler) }))
 
 	defer func() {
+		//nolint:errorlint // recover() value, not an error chain; same check as net/http
 		if got := recover(); got != http.ErrAbortHandler {
 			t.Fatalf("recovered %v, want http.ErrAbortHandler passed through", got)
 		}
@@ -80,18 +81,23 @@ func TestAConnectionCanBeHijackedThroughTheMiddleware(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: test\r\n\r\n")
+		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: test\r\n\r\n")
 		rw.Flush()
 	}))))
 	defer srv.Close()
 
-	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	var d net.Dialer
+	conn, err := d.DialContext(t.Context(), "tcp", strings.TrimPrefix(srv.URL, "http://"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(timeout))
-	conn.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"))
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
 
 	line, err := bufio.NewReader(conn).ReadString('\n')
 	if err != nil || !strings.HasPrefix(line, "HTTP/1.1 101") {

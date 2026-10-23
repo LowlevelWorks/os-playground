@@ -34,7 +34,7 @@ func NewServer(manager VMManager, allowedOrigins []string, limits RateLimits, lo
 	mux.HandleFunc("OPTIONS /vms/{id}", func(w http.ResponseWriter, r *http.Request) {})
 	terminalRoute(mux, terminal, limits.TrustedProxyHops)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, "ok\n")
+		_, _ = io.WriteString(w, "ok\n")
 	})
 
 	// Outermost first: the access log must see what recovery turned a panic into.
@@ -90,7 +90,8 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
-	w.Write(append(body, '\n'))
+	// The status is already sent; a failed write only means the client left.
+	_, _ = w.Write(append(body, '\n'))
 }
 
 // writeError is the one error shape clients see: {"error": "..."}.

@@ -92,9 +92,16 @@ func TestFinish(t *testing.T) {
 	}
 }
 
+func mustCreate(t *testing.T, f *fake.Fake, id string) {
+	t.Helper()
+	if _, err := f.Create(bg, spec(id)); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestConsoleRoundTrip(t *testing.T) {
 	f := fake.New(fake.WithAutoRun())
-	f.Create(bg, spec("vm-1"))
+	mustCreate(t, f, "vm-1")
 
 	c, err := f.Console(bg, "vm-1")
 	if err != nil {
@@ -107,14 +114,14 @@ func TestConsoleRoundTrip(t *testing.T) {
 	}
 
 	// Pipes block until the other side reads, so write from goroutines.
-	go g.Write([]byte("os> "))
+	go func() { _, _ = g.Write([]byte("os> ")) }() // a failed write fails the read below
 	buf := make([]byte, 16)
 	n, err := c.Read(buf)
 	if err != nil || string(buf[:n]) != "os> " {
 		t.Fatalf("client read %q, %v; want the guest's prompt", buf[:n], err)
 	}
 
-	go c.Write([]byte("help\n"))
+	go func() { _, _ = c.Write([]byte("help\n")) }()
 	n, err = g.Read(buf)
 	if err != nil || string(buf[:n]) != "help\n" {
 		t.Fatalf("guest read %q, %v; want the client's keystrokes", buf[:n], err)
@@ -123,7 +130,7 @@ func TestConsoleRoundTrip(t *testing.T) {
 
 func TestFinishEndsConsole(t *testing.T) {
 	f := fake.New(fake.WithAutoRun())
-	f.Create(bg, spec("vm-1"))
+	mustCreate(t, f, "vm-1")
 	c, _ := f.Console(bg, "vm-1")
 	defer c.Close()
 
@@ -148,7 +155,7 @@ func TestFinishEndsConsole(t *testing.T) {
 
 func TestGuestNeedsAnAttachedConsole(t *testing.T) {
 	f := fake.New(fake.WithAutoRun())
-	f.Create(bg, spec("vm-1"))
+	mustCreate(t, f, "vm-1")
 
 	if _, err := f.Guest("vm-1"); !errors.Is(err, fake.ErrNotAttached) {
 		t.Errorf("Guest with nothing attached = %v, want ErrNotAttached", err)
@@ -160,7 +167,7 @@ func TestGuestNeedsAnAttachedConsole(t *testing.T) {
 
 func TestStaleCloseDoesNotDetachANewConsole(t *testing.T) {
 	f := fake.New(fake.WithAutoRun())
-	f.Create(bg, spec("vm-1"))
+	mustCreate(t, f, "vm-1")
 
 	old, _ := f.Console(bg, "vm-1")
 	old.Close()
@@ -178,11 +185,13 @@ func TestStaleCloseDoesNotDetachANewConsole(t *testing.T) {
 
 func TestLenTracksSlots(t *testing.T) {
 	f := fake.New(fake.WithCapacity(1))
-	f.Create(bg, spec("vm-1"))
+	mustCreate(t, f, "vm-1")
 	if f.Len() != 1 {
 		t.Fatalf("Len = %d, want 1", f.Len())
 	}
-	f.Delete(bg, "vm-1")
+	if err := f.Delete(bg, "vm-1"); err != nil {
+		t.Fatal(err)
+	}
 	if f.Len() != 0 {
 		t.Fatalf("Len = %d after Delete, want 0", f.Len())
 	}

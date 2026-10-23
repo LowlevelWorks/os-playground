@@ -105,6 +105,7 @@ func recoverPanic(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if v := recover(); v != nil {
+				//nolint:errorlint // recover() value, not a wrapped error; same check as net/http
 				if v == http.ErrAbortHandler {
 					panic(v)
 				}

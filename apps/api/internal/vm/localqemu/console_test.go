@@ -128,7 +128,9 @@ func TestConsoleCloseDetachesButTheVMKeepsRunning(t *testing.T) {
 	// The same VM is still alive and answers a new client.
 	c2 := attachConsole(t, p)
 	defer c2.Close()
-	c2.Write([]byte("again\n"))
+	if _, err := c2.Write([]byte("again\n")); err != nil {
+		t.Fatal(err)
+	}
 	if got := readN(t, c2, len("again\n")); got != "again\n" {
 		t.Fatalf("echo after reattach = %q", got)
 	}
@@ -145,7 +147,9 @@ func TestConsoleStaleClientCannotTypeIntoANewSession(t *testing.T) {
 	if _, err := old.Write([]byte("ghost\n")); err == nil {
 		t.Fatal("a closed console could still write")
 	}
-	c.Write([]byte("real\n"))
+	if _, err := c.Write([]byte("real\n")); err != nil {
+		t.Fatal(err)
+	}
 	if got := readN(t, c, len("real\n")); got != "real\n" {
 		t.Fatalf("new client saw %q, want only its own input", got)
 	}
@@ -182,7 +186,7 @@ func TestConsoleVMEndingEndsTheStream(t *testing.T) {
 
 	select {
 	case err := <-res:
-		if err != io.EOF {
+		if err != io.EOF { //nolint:errorlint // io.Reader contract: Read returns io.EOF itself, unwrapped
 			t.Fatalf("blocked Read = %v, want EOF", err)
 		}
 	case <-time.After(10 * time.Second):
@@ -236,7 +240,7 @@ func TestConsoleStalledGuestDoesNotLockOutLaterWriters(t *testing.T) {
 
 	// Fill the pipe, then queue several more writers behind the stall.
 	c := attachConsole(t, p)
-	c.Write(bytes.Repeat([]byte("x"), 4<<20))
+	_, _ = c.Write(bytes.Repeat([]byte("x"), 4<<20)) // expected to stall and time out; it only fills the pipe
 
 	var wg sync.WaitGroup
 	for i := 0; i < 4; i++ {
@@ -305,7 +309,7 @@ func TestProcessLeavesNoFileDescriptorsBehind(t *testing.T) {
 		for _, mode := range []string{"boot", "echo", "poweroff", "crash"} {
 			p := startFake(t, mode, patient)
 			if c, err := p.attach(); err == nil {
-				c.Write([]byte("hi\n"))
+				_, _ = c.Write([]byte("hi\n")) // fails in the crash and poweroff modes; only the race matters
 				c.Close()
 			}
 			p.stop()
@@ -340,7 +344,7 @@ func TestConsoleWriteWaitsForTheInputLock(t *testing.T) {
 
 	p.stdinMu.Lock()
 	wrote := make(chan struct{})
-	go func() { c.Write([]byte("queued\n")); close(wrote) }()
+	go func() { _, _ = c.Write([]byte("queued\n")); close(wrote) }()
 
 	select {
 	case <-wrote:

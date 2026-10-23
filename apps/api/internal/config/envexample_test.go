@@ -61,7 +61,7 @@ func settingNames(t *testing.T) []string {
 // godotenv.Read would hide.
 func keysIn(t *testing.T, path string) []string {
 	t.Helper()
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: path is envExamplePath or envLocalPath, both constants
 	if err != nil {
 		t.Fatal(err)
 	}

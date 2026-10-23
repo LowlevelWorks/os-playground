@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+
 	"github.com/os-playground-api/internal/session"
 	"github.com/os-playground-api/internal/vm"
 	"github.com/os-playground-api/internal/vm/fake"
@@ -120,7 +121,7 @@ func (e *env) dialOffering(id, origin string, protocols []string) (*websocket.Co
 	}
 	c, resp, err := websocket.Dial(ctx, e.url(id), opts)
 	if c != nil {
-		e.t.Cleanup(func() { c.CloseNow() })
+		e.t.Cleanup(func() { _ = c.CloseNow() })
 	}
 	return c, resp, err
 }
@@ -128,7 +129,7 @@ func (e *env) dialOffering(id, origin string, protocols []string) (*websocket.Co
 // mustDial dials and fails the test if the connection is refused.
 func (e *env) mustDial() *websocket.Conn {
 	e.t.Helper()
-	c, _, err := e.dial(vmID, "")
+	c, _, err := e.dial(vmID, "") //nolint:bodyclose // websocket.Dial: "You never need to close resp.Body yourself"
 	if err != nil {
 		e.t.Fatalf("dial: %v", err)
 	}
@@ -224,7 +225,7 @@ func attachRequest(id string) *http.Request {
 }
 
 func TestAttachErrorsBecomeStatusCodes(t *testing.T) {
-	secret := "open /home/ops/images/secret.iso: permission denied"
+	secret := "open /home/ops/images/secret.iso: permission denied" //nolint:gosec // G101: a host path that must not leak, not a credential
 
 	tests := []struct {
 		name string
@@ -289,7 +290,7 @@ func TestNewHandlerWithoutLoggerDoesNotPanic(t *testing.T) {
 func TestUnknownVMIs404(t *testing.T) {
 	e := newEnv(t)
 
-	_, resp, err := e.dial("no-such-vm", "")
+	_, resp, err := e.dial("no-such-vm", "") //nolint:bodyclose // websocket.Dial: "You never need to close resp.Body yourself"
 
 	if err == nil || statusOf(resp) != http.StatusNotFound {
 		t.Fatalf("dial = status %d, err %v; want 404", statusOf(resp), err)
@@ -310,7 +311,7 @@ func TestTerminalCarriesBytesBothWays(t *testing.T) {
 		t.Fatalf("guest got %q, want %q", got, "ls\n")
 	}
 
-	go guest.Write([]byte("kernel ready"))
+	go func() { _, _ = guest.Write([]byte("kernel ready")) }() // a failed write fails the read below
 	if got := readFrame(t, client); string(got) != "kernel ready" {
 		t.Fatalf("browser got %q, want %q", got, "kernel ready")
 	}
@@ -321,12 +322,12 @@ func TestSecondClientGets409AndTheFirstIsUnharmed(t *testing.T) {
 	first := e.mustDial()
 	guest := e.guest()
 
-	_, resp, err := e.dial(vmID, "")
+	_, resp, err := e.dial(vmID, "") //nolint:bodyclose // websocket.Dial: "You never need to close resp.Body yourself"
 	if err == nil || statusOf(resp) != http.StatusConflict {
 		t.Fatalf("second dial = status %d, err %v; want 409", statusOf(resp), err)
 	}
 
-	go guest.Write([]byte("still here"))
+	go func() { _, _ = guest.Write([]byte("still here")) }() // a failed write fails the read below
 	if got := readFrame(t, first); string(got) != "still here" {
 		t.Fatalf("first client got %q after the second was refused", got)
 	}
@@ -372,7 +373,7 @@ func TestVMEndingClosesTheSocket(t *testing.T) {
 func TestOriginMustBeAllowed(t *testing.T) {
 	e := newEnv(t)
 
-	_, resp, err := e.dial(vmID, "http://evil.example")
+	_, resp, err := e.dial(vmID, "http://evil.example") //nolint:bodyclose // websocket.Dial: "You never need to close resp.Body yourself"
 	if err == nil || statusOf(resp) != http.StatusForbidden {
 		t.Fatalf("dial from a foreign origin = status %d, err %v; want 403", statusOf(resp), err)
 	}
@@ -380,7 +381,7 @@ func TestOriginMustBeAllowed(t *testing.T) {
 		t.Fatal("a rejected origin left the console attached")
 	}
 
-	if _, _, err := e.dial(vmID, "http://localhost:3000"); err != nil {
+	if _, _, err := e.dial(vmID, "http://localhost:3000"); err != nil { //nolint:bodyclose // websocket.Dial: "You never need to close resp.Body yourself"
 		t.Fatalf("dial from the allowed origin: %v", err)
 	}
 }
@@ -392,7 +393,7 @@ func TestFailedUpgradeFreesTheConsole(t *testing.T) {
 
 	// A plain request with the right offer, but no upgrade headers: the
 	// console is attached, then the upgrade fails.
-	req, _ := http.NewRequest("GET", e.srv.URL+"/ws/vms/"+vmID, nil)
+	req, _ := http.NewRequestWithContext(t.Context(), "GET", e.srv.URL+"/ws/vms/"+vmID, nil)
 	req.Header.Set("Sec-WebSocket-Protocol", strings.Join(wsOffer(tokenA), ", "))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -436,7 +437,7 @@ func TestNewConnectionsAreRefusedAfterShutdown(t *testing.T) {
 		t.Fatalf("Shutdown = %v", err)
 	}
 
-	_, resp, err := e.dial(vmID, "")
+	_, resp, err := e.dial(vmID, "") //nolint:bodyclose // websocket.Dial: "You never need to close resp.Body yourself"
 
 	if err == nil || statusOf(resp) != http.StatusServiceUnavailable {
 		t.Fatalf("dial after Shutdown = status %d, err %v; want 503", statusOf(resp), err)
@@ -462,7 +463,7 @@ func TestRequestsDuringShutdownDoNotRaceOrLeak(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			req, _ := http.NewRequest("GET", e.srv.URL+"/ws/vms/"+vmID, nil)
+			req, _ := http.NewRequestWithContext(t.Context(), "GET", e.srv.URL+"/ws/vms/"+vmID, nil)
 			req.Header.Set("Sec-WebSocket-Protocol", strings.Join(wsOffer(tokenA), ", "))
 			resp, err := http.DefaultClient.Do(req)
 			if err == nil {

@@ -186,7 +186,7 @@ func TestSinkFinishDeliversQueuedDataThenEOF(t *testing.T) {
 	if err != nil || string(buf[:n]) != "last words" {
 		t.Fatalf("first Read = %q, %v", buf[:n], err)
 	}
-	if n, err := r.Read(buf); n != 0 || err != io.EOF {
+	if n, err := r.Read(buf); n != 0 || err != io.EOF { //nolint:errorlint // io.Reader contract: Read returns io.EOF itself, unwrapped
 		t.Fatalf("second Read = %d, %v; want 0, EOF", n, err)
 	}
 }
@@ -198,7 +198,7 @@ func TestSinkFinishWakesBlockedReader(t *testing.T) {
 	s.finish()
 	select {
 	case res := <-ch:
-		if res.err != io.EOF {
+		if res.err != io.EOF { //nolint:errorlint // io.Reader contract: Read returns io.EOF itself, unwrapped
 			t.Fatalf("err = %v, want EOF", res.err)
 		}
 	case <-time.After(wait):
@@ -355,7 +355,7 @@ func TestSinkConcurrentConservation(t *testing.T) {
 }
 
 // Random writes and reads against a model that is obviously correct: a
-// byte slice from which only the newest max bytes are kept.
+// byte slice from which only the newest limit bytes are kept.
 func FuzzSinkAgainstModel(f *testing.F) {
 	f.Add([]byte{4, 0, 9, 1, 3, 0, 20, 1, 5})
 	f.Add([]byte{1, 0, 3, 0, 3, 1, 1})
@@ -365,10 +365,10 @@ func FuzzSinkAgainstModel(f *testing.F) {
 		if len(data) < 1 {
 			return
 		}
-		max := 1 + int(data[0])%16
+		limit := 1 + int(data[0])%16
 		data = data[1:]
 
-		s := newSink(max)
+		s := newSink(limit)
 		r, _ := s.attach()
 		var model []byte
 		var written, readTotal int64
@@ -378,8 +378,8 @@ func FuzzSinkAgainstModel(f *testing.F) {
 			op, arg := data[0], int(data[1])
 			data = data[2:]
 
-			if op%2 == 0 { // write arg%(2*max+1) bytes
-				n := arg % (2*max + 1)
+			if op%2 == 0 { // write arg%(2*limit+1) bytes
+				n := arg % (2*limit + 1)
 				p := make([]byte, n)
 				for i := range p {
 					counter++
@@ -387,15 +387,15 @@ func FuzzSinkAgainstModel(f *testing.F) {
 				}
 				s.Write(p)
 				model = append(model, p...)
-				if len(model) > max {
-					model = model[len(model)-max:]
+				if len(model) > limit {
+					model = model[len(model)-limit:]
 				}
 				written += int64(n)
 			} else { // read, only when the model says it will not block
 				if len(model) == 0 {
 					continue
 				}
-				size := 1 + arg%(max+3)
+				size := 1 + arg%(limit+3)
 				buf := make([]byte, size)
 				n, err := r.Read(buf)
 				if err != nil {

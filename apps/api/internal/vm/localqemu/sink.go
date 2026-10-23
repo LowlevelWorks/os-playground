@@ -39,13 +39,13 @@ type sink struct {
 	seen  bool
 }
 
-func newSink(max int) *sink {
-	if max <= 0 {
+func newSink(limit int) *sink {
+	if limit <= 0 {
 		panic("localqemu: sink size must be positive")
 	}
 
 	s := &sink{
-		ring:  make([]byte, max),
+		ring:  make([]byte, limit),
 		first: make(chan struct{}),
 	}
 	s.cond = sync.NewCond(&s.mu)
@@ -73,19 +73,19 @@ func (s *sink) Write(p []byte) (int, error) {
 		close(s.first)
 	}
 
-	max := len(s.ring)
-	if n >= max {
-		// Only the newest max bytes can survive, whatever was queued before.
-		s.dropped += int64(s.size + n - max)
-		copy(s.ring, p[n-max:])
-		s.head, s.size = 0, max
+	limit := len(s.ring)
+	if n >= limit {
+		// Only the newest limit bytes can survive, whatever was queued before.
+		s.dropped += int64(s.size + n - limit)
+		copy(s.ring, p[n-limit:])
+		s.head, s.size = 0, limit
 	} else {
-		if over := s.size + n - max; over > 0 {
-			s.head = (s.head + over) % max // discard the oldest bytes
+		if over := s.size + n - limit; over > 0 {
+			s.head = (s.head + over) % limit // discard the oldest bytes
 			s.size -= over
 			s.dropped += int64(over)
 		}
-		tail := (s.head + s.size) % max
+		tail := (s.head + s.size) % limit
 		k := copy(s.ring[tail:], p) // up to the end of the array
 		copy(s.ring, p[k:])         // the rest wraps to the start
 		s.size += n

@@ -6,4 +6,6 @@ build/
 dist/
 *.o
 *.log
+bin/
+.tools/
 .DS_Store

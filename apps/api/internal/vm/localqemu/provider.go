@@ -90,7 +90,7 @@ var _ vm.Provider = (*Provider)(nil)
 // New checks the configuration and that QEMU exists, so a mistake stops the
 // server at startup instead of failing the first user's session.
 func New(cfg Config) (*Provider, error) {
-	opts, err := cfg.Options.normalized()
+	opts, err := cfg.Options.normalized() //nolint:staticcheck // QF1008: Options is the user's input, not Config's own method
 
 	var errs []error
 	if err != nil {
@@ -181,7 +181,7 @@ func (p *Provider) Create(ctx context.Context, spec vm.Spec) (vm.Instance, error
 		p.unregister(proc)
 		return vm.Instance{}, err
 	}
-	go p.watch(proc)
+	go p.watch(proc) //nolint:gosec // G118: by design the VM outlives the request; see the doc comment
 
 	p.log.Info("vm started", "id", spec.ID, "image", spec.Image, "memory_mb", spec.MemoryMB)
 	return proc.snapshot(), nil
@@ -250,6 +250,11 @@ func (p *Provider) Console(ctx context.Context, id string) (io.ReadWriteCloser, 
 // ctx ends. It is how a graceful shutdown makes sure nothing is left running,
 // so give it a deadline of a few seconds. Create fails after Close. It is safe
 // to call more than once.
+//
+// Close waits for the QEMU processes, not for the provider's own goroutines:
+// each VM's watcher logs "vm ended" and frees its slot a moment after the
+// process is gone. A program that exits right after Close can miss those log
+// lines.
 func (p *Provider) Close(ctx context.Context) error {
 	p.mu.Lock()
 	p.closed = true
@@ -327,7 +332,7 @@ func (p *Provider) watch(proc *process) {
 		level = slog.LevelWarn
 	}
 	p.log.Log(context.Background(), level, "vm ended",
-		"id", got.ID, "status", got.Status, "reason", got.Reason)
+		"id", got.ID, "status", got.Status, "reason", got.Reason, "lifetime", proc.lifetime())
 
 	p.mu.Lock()
 	if e := p.vms[proc.id]; e != nil && e.proc == proc && e.deleting {
@@ -339,7 +344,7 @@ func (p *Provider) watch(proc *process) {
 func checkImageFile(path string) error {
 	fi, err := os.Stat(path)
 	if err != nil {
-		return fmt.Errorf("%w: image: %v", vm.ErrInvalidSpec, err)
+		return fmt.Errorf("%w: image: %w", vm.ErrInvalidSpec, err)
 	}
 	if !fi.Mode().IsRegular() {
 		return fmt.Errorf("%w: image %q is not a regular file", vm.ErrInvalidSpec, path)
