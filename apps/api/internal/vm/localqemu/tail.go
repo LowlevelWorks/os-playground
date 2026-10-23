@@ -13,16 +13,16 @@ import (
 type tailBuffer struct {
 	mu        sync.Mutex
 	buf       []byte
-	max       int
+	limit     int
 	truncated bool // older bytes were discarded
 }
 
-// newTailBuffer returns a buffer that keeps at most max bytes.
-func newTailBuffer(max int) *tailBuffer {
-	if max <= 0 {
+// newTailBuffer returns a buffer that keeps at most limit bytes.
+func newTailBuffer(limit int) *tailBuffer {
+	if limit <= 0 {
 		panic("localqemu: tail size must be positive")
 	}
-	return &tailBuffer{max: max}
+	return &tailBuffer{limit: limit}
 }
 
 // Write implements io.Writer. It always reports success.
@@ -32,13 +32,13 @@ func (t *tailBuffer) Write(p []byte) (int, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if n >= t.max {
-		t.truncated = t.truncated || n > t.max || len(t.buf) > 0
-		t.buf = append(t.buf[:0], p[n-t.max:]...)
+	if n >= t.limit {
+		t.truncated = t.truncated || n > t.limit || len(t.buf) > 0
+		t.buf = append(t.buf[:0], p[n-t.limit:]...)
 		return n, nil
 	}
 	t.buf = append(t.buf, p...)
-	if over := len(t.buf) - t.max; over > 0 {
+	if over := len(t.buf) - t.limit; over > 0 {
 		t.buf = append(t.buf[:0], t.buf[over:]...)
 		t.truncated = true
 	}

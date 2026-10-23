@@ -49,6 +49,7 @@ func (o Options) normalized() (Options, error) {
 		errs = append(errs, fmt.Errorf("MaxMemoryMB=%d: must be greater than 0", o.MaxMemoryMB))
 	}
 	if !accelerators[o.Accelerator] {
+		//nolint:staticcheck // ST1005: names the Options field, like the CPUs and MaxMemoryMB errors above
 		errs = append(errs, fmt.Errorf("Accelerator=%q: must be empty, tcg, kvm or hvf", o.Accelerator))
 	}
 	if err := errors.Join(errs...); err != nil {
@@ -92,7 +93,7 @@ func buildArgs(spec vm.Spec, opts Options) ([]string, error) {
 		return nil, err
 	}
 	if err := checkImagePath(spec.Image); err != nil {
-		return nil, fmt.Errorf("%w: Image %q %v", vm.ErrInvalidSpec, spec.Image, err)
+		return nil, fmt.Errorf("%w: Image %q %w", vm.ErrInvalidSpec, spec.Image, err)
 	}
 	if spec.MemoryMB > opts.MaxMemoryMB {
 		return nil, fmt.Errorf("%w: MemoryMB %d exceeds this provider's limit of %d",

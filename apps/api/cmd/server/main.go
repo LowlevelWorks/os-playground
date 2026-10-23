@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+
 	"github.com/os-playground-api/internal/config"
 	"github.com/os-playground-api/internal/httpserver"
 	"github.com/os-playground-api/internal/session"
@@ -95,15 +96,16 @@ func run() error {
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	// Bind before starting anything else: "address already in use" then fails
 	// at once with nothing left running.
-	ln, err := net.Listen("tcp", cfg.ListenAddr)
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", cfg.ListenAddr)
 	if err != nil {
 		return err
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	reaperDone := make(chan struct{})
 	go func() {

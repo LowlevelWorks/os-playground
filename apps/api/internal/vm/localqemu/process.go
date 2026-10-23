@@ -227,6 +227,7 @@ func (p *process) failureReason(err error) string {
 	var ee *exec.ExitError
 	msg := "qemu: " + err.Error()
 	if errors.As(err, &ee) {
+		//nolint:staticcheck // QF1008: ExitError has both Error and String; name the one meant
 		msg = "qemu: " + ee.ProcessState.String() // "exit status 1", "signal: killed"
 	}
 	if tail := p.stderr.String(); tail != "" {

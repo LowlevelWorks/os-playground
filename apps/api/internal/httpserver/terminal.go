@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/coder/websocket"
+
 	"github.com/os-playground-api/internal/session"
 	"github.com/os-playground-api/internal/terminal"
 	"github.com/os-playground-api/internal/vm"

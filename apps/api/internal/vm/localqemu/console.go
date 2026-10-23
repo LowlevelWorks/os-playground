@@ -81,8 +81,13 @@ func (p *process) writeStdin(b []byte) (int, error) {
 	if p.ended() {
 		return 0, io.ErrClosedPipe
 	}
-	p.stdin.SetWriteDeadline(time.Now().Add(p.writeTimeout))
-	n, err := p.stdin.Write(b)
+	// No deadline, no write: without it a guest that stops reading would block
+	// this write, and every writer queued on stdinMu, forever.
+	n := 0
+	err := p.stdin.SetWriteDeadline(time.Now().Add(p.writeTimeout))
+	if err == nil {
+		n, err = p.stdin.Write(b)
+	}
 	switch {
 	case err == nil:
 		return n, nil

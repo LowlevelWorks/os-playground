@@ -169,7 +169,9 @@ func wsAPI(t *testing.T, a *api) string {
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		a.srv.Shutdown(ctx)
+		if err := a.srv.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown: %v", err)
+		}
 		srv.Close()
 	})
 	return "ws" + strings.TrimPrefix(srv.URL, "http")
@@ -179,11 +181,11 @@ func dialWS(t *testing.T, url string, protocols []string) (*websocket.Conn, int)
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	c, resp, err := websocket.Dial(ctx, url, &websocket.DialOptions{Subprotocols: protocols})
+	c, resp, err := websocket.Dial(ctx, url, &websocket.DialOptions{Subprotocols: protocols}) //nolint:bodyclose // websocket.Dial: "You never need to close resp.Body yourself"
 	if err != nil {
 		return nil, statusOf(resp)
 	}
-	t.Cleanup(func() { c.CloseNow() })
+	t.Cleanup(func() { _ = c.CloseNow() })
 	return c, statusOf(resp)
 }
 

@@ -204,7 +204,7 @@ func checkReadableFile(path string) error {
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("%s is not a regular file", path)
 	}
-	f, err := os.Open(path)
+	f, err := os.Open(path) //nolint:gosec // G304: path comes from the operator's config, not from a request
 	if err != nil {
 		return err
 	}
@@ -266,7 +266,7 @@ func (l *loader) duration(key string, def time.Duration) time.Duration {
 func checkListenAddr(addr string) error {
 	_, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
-		return fmt.Errorf("must be host:port, for example %q (%v)", defaultAddr, err)
+		return fmt.Errorf("must be host:port, for example %q (%w)", defaultAddr, err)
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil || port < 1 || port > 65535 {

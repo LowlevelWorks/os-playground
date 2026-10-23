@@ -26,27 +26,27 @@ func TestHelperProcess(t *testing.T) {
 	out := os.Stdout
 	switch mode {
 	case "boot": // prints a banner, then runs until killed
-		out.WriteString("booted\n")
+		_, _ = out.WriteString("booted\n")
 		time.Sleep(time.Hour)
 	case "echo": // a guest that echoes the keyboard, like a shell would
-		out.WriteString("ready\n")
-		io.Copy(out, os.Stdin)
+		_, _ = out.WriteString("ready\n")
+		_, _ = io.Copy(out, os.Stdin)
 		os.Exit(0)
 	case "silent": // alive but never prints
 		time.Sleep(time.Hour)
 	case "slowboot": // prints after FAKE_DELAY_MS, then runs until killed
 		ms, _ := strconv.Atoi(os.Getenv("FAKE_DELAY_MS"))
 		time.Sleep(time.Duration(ms) * time.Millisecond)
-		out.WriteString("up\n")
+		_, _ = out.WriteString("up\n")
 		time.Sleep(time.Hour)
 	case "crash": // QEMU refusing to start
 		os.Stderr.WriteString("qemu-system-x86_64: could not open image\n")
 		os.Exit(1)
 	case "poweroff": // guest shuts down by itself
-		out.WriteString("bye\n")
+		_, _ = out.WriteString("bye\n")
 		os.Exit(0)
 	case "child": // leaves a grandchild behind, like a helper QEMU might
-		c := exec.Command("sleep", "300")
+		c := exec.Command("sleep", "300") //nolint:noctx // the point is a grandchild that outlives this process
 		if err := c.Start(); err != nil {
 			os.Exit(3)
 		}
@@ -55,7 +55,7 @@ func TestHelperProcess(t *testing.T) {
 	case "flood": // 16 MB of output that nobody reads
 		chunk := make([]byte, 64<<10)
 		for i := 0; i < 256; i++ {
-			out.Write(chunk)
+			_, _ = out.Write(chunk)
 		}
 		os.Exit(0)
 	}
@@ -64,7 +64,7 @@ func TestHelperProcess(t *testing.T) {
 
 func fakeCommand(mode string, env ...string) commandFunc {
 	return func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
-		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestHelperProcess$")
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestHelperProcess$") //nolint:gosec // G204: re-runs this test binary
 		// atexit_sleep_ms=0: a race-enabled binary otherwise sleeps 1s at exit.
 		cmd.Env = append(append(os.Environ(), "FAKE_QEMU="+mode, "GORACE=atexit_sleep_ms=0"), env...)
 		return cmd
@@ -130,7 +130,7 @@ func TestProcessBootsThenStops(t *testing.T) {
 	if got := p.snapshot(); got.ID != "vm-1" || got.Image != "/images/os.iso" || got.CreatedAt.IsZero() {
 		t.Fatalf("snapshot lost identity: %+v", got)
 	}
-	if _, err := r.Read(buf); err != io.EOF {
+	if _, err := r.Read(buf); err != io.EOF { //nolint:errorlint // io.Reader contract: Read returns io.EOF itself, unwrapped
 		t.Fatalf("console after stop = %v, want EOF", err)
 	}
 	p.stop() // again: no panic, no hang

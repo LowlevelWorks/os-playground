@@ -29,7 +29,7 @@ func testImage(t *testing.T) string {
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	path := filepath.Join(dir, "os.iso")
-	if err := os.WriteFile(path, []byte("not really an iso"), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("not really an iso"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -509,12 +509,13 @@ func TestCreateDeleteGetConsoleRaceOnOneID(t *testing.T) {
 			go func() { defer wg.Done(); f() }()
 		}
 		for i := 0; i < 2; i++ {
-			run(func() { p.Create(bg(), specFor(img, "vm-race")) })
-			run(func() { p.Delete(bg(), "vm-race") })
-			run(func() { p.Get(bg(), "vm-race") })
+			// Results are ignored on purpose: only deadlocks, leaks and races fail this.
+			run(func() { _, _ = p.Create(bg(), specFor(img, "vm-race")) })
+			run(func() { _ = p.Delete(bg(), "vm-race") })
+			run(func() { _, _ = p.Get(bg(), "vm-race") })
 			run(func() {
 				if c, err := p.Console(bg(), "vm-race"); err == nil {
-					c.Write([]byte("x\n"))
+					_, _ = c.Write([]byte("x\n"))
 					c.Close()
 				}
 			})

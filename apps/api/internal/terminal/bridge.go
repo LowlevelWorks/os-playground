@@ -45,7 +45,7 @@ func Bridge(ctx context.Context, ws *websocket.Conn, console io.ReadWriteCloser)
 	g.Go(func() error { // closer: Reads on the console do not watch ctx
 		<-ctx.Done()
 		console.Close()
-		ws.CloseNow()
+		_ = ws.CloseNow() // shutting down either way; nothing to do with the error
 		return ctx.Err()
 	})
 

@@ -252,7 +252,9 @@ func TestDeleteRetryAfterAFailedAttemptDoesTheWork(t *testing.T) {
 func TestReapFinishesAnAbandonedDelete(t *testing.T) {
 	r := newRig(t)
 	id := r.create()
-	r.m.Delete(cancelled(), id, alice)
+	if err := r.m.Delete(cancelled(), id, alice); !errors.Is(err, context.Canceled) {
+		t.Fatalf("setup: Delete with a cancelled ctx = %v, want context.Canceled", err)
+	}
 
 	r.m.Reap(context.Background())
 
@@ -366,7 +368,9 @@ func TestClosingAConsoleTwiceCountsOnce(t *testing.T) {
 func TestReapForgetsSessionsTheProviderLost(t *testing.T) {
 	r := newRig(t)
 	id := r.create()
-	r.fake.Delete(context.Background(), id) // gone behind the manager's back
+	if err := r.fake.Delete(context.Background(), id); err != nil { // gone behind the manager's back
+		t.Fatal(err)
+	}
 
 	r.m.Reap(context.Background())
 
@@ -440,9 +444,10 @@ func TestConcurrentUse(t *testing.T) {
 				if c, err := r.m.Console(context.Background(), inst.ID, alice); err == nil {
 					c.Close()
 				}
-				r.m.Get(context.Background(), inst.ID, alice)
+				// Results are ignored on purpose: only deadlocks and races fail this.
+				_, _ = r.m.Get(context.Background(), inst.ID, alice)
 				r.m.Reap(context.Background())
-				r.m.Delete(context.Background(), inst.ID, alice)
+				_ = r.m.Delete(context.Background(), inst.ID, alice)
 			}
 		}()
 	}

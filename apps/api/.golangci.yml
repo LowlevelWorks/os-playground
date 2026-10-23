@@ -1,0 +1,75 @@
+version: "2"
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose
+    - errorlint
+    - gosec
+    - misspell
+    - noctx
+    - nolintlint
+    - revive
+  settings:
+    errcheck:
+      # Both are documented to always return a nil error (see their Write docs).
+      exclude-functions:
+        - (*github.com/os-playground-api/internal/vm/localqemu.sink).Write
+        - (*github.com/os-playground-api/internal/vm/localqemu.tailBuffer).Write
+    gosec:
+      excludes:
+        - G104 # unchecked errors: errcheck owns that policy (see std-error-handling)
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    revive:
+      # revive's defaults minus three: exported and package-comments (doc rules
+      # for public APIs; everything here is internal/), and unused-parameter
+      # (http.HandlerFunc and other fixed signatures).
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+          arguments:
+            - allowTypesBefore: "*testing.T"
+        - name: context-keys-type
+        - name: dot-imports
+        - name: empty-block
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: errorf
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: range
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: time-naming
+        - name: unexported-return
+        - name: unreachable-code
+        - name: var-declaration
+        - name: var-naming
+  exclusions:
+    generated: lax
+    presets:
+      # Unchecked Close, Flush, Remove and print errors. Every site is cleanup or
+      # shutdown where the error changes nothing.
+      - std-error-handling
+    rules:
+      # httptest.NewRequest builds an in-memory request: no I/O to cancel.
+      - path: _test\.go
+        linters: [noctx]
+        text: httptest\.NewRequest must not be called
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/os-playground-api
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

@@ -129,7 +129,7 @@ func start(t *testing.T) *harness {
 
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), timeout)
 	defer dialCancel()
-	client, _, err := websocket.Dial(dialCtx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	client, _, err := websocket.Dial(dialCtx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil) //nolint:bodyclose // websocket.Dial: "You never need to close resp.Body yourself"
 	if err != nil {
 		srv.Close()
 		cancel()
@@ -139,7 +139,7 @@ func start(t *testing.T) *harness {
 
 	t.Cleanup(func() {
 		cancel()
-		client.CloseNow()
+		_ = client.CloseNow()
 		h.console.Close()
 		select {
 		case <-h.done:
@@ -262,8 +262,8 @@ func TestOutputBeforeTheEndIsNotLost(t *testing.T) {
 func TestLargeOutputIsSplitIntoFrames(t *testing.T) {
 	h := start(t)
 
-	want := bytes.Repeat([]byte("0123456789"), 1000) // 10000 bytes, over two chunks
-	go h.console.outW.Write(want)                    // blocks until the bridge has read it all
+	want := bytes.Repeat([]byte("0123456789"), 1000)  // 10000 bytes, over two chunks
+	go func() { _, _ = h.console.outW.Write(want) }() // blocks until the bridge has read it all
 
 	var got []byte
 	for len(got) < len(want) {
