@@ -98,6 +98,8 @@ func TestBadValuesAreRejected(t *testing.T) {
 		{"negative rate limit", map[string]string{EnvRateLimitRPS: "-1"}, EnvRateLimitRPS},
 		{"rate without burst", map[string]string{EnvRateLimitBurst: "0"}, EnvRateLimitBurst},
 		{"too many proxy hops", map[string]string{EnvTrustedProxyHops: "99"}, EnvTrustedProxyHops},
+		{"unknown accelerator", map[string]string{EnvQEMUAccel: "kvn"}, EnvQEMUAccel},
+		{"accelerator with injected option", map[string]string{EnvQEMUAccel: "tcg,thread=multi"}, EnvQEMUAccel},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -160,5 +162,58 @@ func TestImageMustBeAFile(t *testing.T) {
 	}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("Validate accepted a directory as the image")
+	}
+}
+
+func TestAcceleratorDefaultsToQEMUsChoiceAndIgnoresCase(t *testing.T) {
+	cfg, err := Load(env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.QEMUAccel != "" {
+		t.Errorf("default QEMUAccel = %q, want empty", cfg.QEMUAccel)
+	}
+
+	cfg, err = Load(env(map[string]string{EnvQEMUAccel: " KVM "}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.QEMUAccel != "kvm" {
+		t.Errorf("QEMUAccel = %q, want kvm", cfg.QEMUAccel)
+	}
+}
+
+func TestValidateChecksKVMDeviceOnlyForKVM(t *testing.T) {
+	dir := t.TempDir()
+	image := filepath.Join(dir, "os.iso")
+	device := filepath.Join(dir, "kvm")
+	for _, p := range []string{image, device} {
+		if err := os.WriteFile(p, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := kvmDevice
+	t.Cleanup(func() { kvmDevice = old })
+
+	validate := func(accel string) error {
+		t.Helper()
+		cfg, err := Load(env(map[string]string{EnvImage: image, EnvQEMUBin: "sh", EnvQEMUAccel: accel}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg.Validate()
+	}
+
+	kvmDevice = device
+	if err := validate("kvm"); err != nil {
+		t.Errorf("kvm with a usable device: %v", err)
+	}
+
+	kvmDevice = filepath.Join(dir, "missing")
+	if err := validate("kvm"); err == nil || !strings.Contains(err.Error(), EnvQEMUAccel) {
+		t.Errorf("kvm without the device: Validate = %v, want an error naming %s", err, EnvQEMUAccel)
+	}
+	if err := validate("tcg"); err != nil {
+		t.Errorf("tcg must not need the device: %v", err)
 	}
 }

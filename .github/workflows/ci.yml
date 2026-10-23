@@ -69,6 +69,45 @@ jobs:
       - run: make build
       - run: make vuln
 
+  # Builds the real image and checks that it starts. docker build --check only
+  # lints: a typo inside a RUN command passes it and fails here.
+  docker:
+    needs: changes
+    if: needs.changes.outputs.api == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/api
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Lint Dockerfile
+        run: docker build --check .
+
+      - name: Build image
+        run: docker build --tag os-playground-api:ci .
+
+      # An empty file stands in for the OS image: the server only checks that
+      # it exists at startup, and no VM is started.
+      - name: Smoke test
+        run: |
+          : > "$RUNNER_TEMP/os.iso"
+          docker run --detach --name api --publish 8080:8080 \
+            --volume "$RUNNER_TEMP/os.iso:/opt/os/os.iso:ro" os-playground-api:ci
+          for _ in $(seq 1 20); do
+            if docker exec api /usr/local/bin/server -healthcheck; then
+              # Also reachable from outside through the published port.
+              curl -fsS http://127.0.0.1:8080/healthz
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs api
+          exit 1
+
   web:
     needs: changes
     if: needs.changes.outputs.web == 'true'
@@ -101,7 +140,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, api, web]
+    needs: [changes, api, web, docker]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
