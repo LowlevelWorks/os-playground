@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -27,18 +28,33 @@ const (
 )
 
 func main() {
+	healthcheck := flag.Bool("healthcheck", false, "ask a running server's /healthz and exit 0 if it answers, 1 if not")
+	flag.Parse()
+
+	if *healthcheck {
+		if err := runHealthcheck(); err != nil {
+			slog.Error("unhealthy", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	// A missing .env is normal (production sets real variables); anything else
-	// is worth saying. Real environment variables always win over the file.
+// loadDotEnv reads .env from the working directory. A missing file is normal
+// (production sets real variables); anything else is worth saying. Real
+// environment variables always win over the file.
+func loadDotEnv() {
 	if err := godotenv.Load(); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		slog.Warn("could not load .env file", "err", err)
 	}
+}
+
+func run() error {
+	loadDotEnv()
 
 	cfg, err := config.Load(os.LookupEnv)
 	if err != nil {
@@ -53,6 +69,7 @@ func run() error {
 
 	provider, err := localqemu.New(localqemu.Config{
 		QEMUBin: cfg.QEMUBin,
+		Options: localqemu.Options{Accelerator: cfg.QEMUAccel},
 		MaxVMs:  cfg.MaxSessions,
 		Logger:  log,
 	})

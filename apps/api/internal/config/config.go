@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ const (
 	EnvAddr           = "PLAYGROUND_ADDR"
 	EnvImage          = "PLAYGROUND_OS_IMAGE"
 	EnvQEMUBin        = "PLAYGROUND_QEMU_BIN"
+	EnvQEMUAccel      = "PLAYGROUND_QEMU_ACCEL"
 	EnvVMMemoryMB     = "PLAYGROUND_VM_MEMORY_MB"
 	EnvMaxSessions    = "PLAYGROUND_MAX_SESSIONS"
 	EnvMaxPerClient   = "PLAYGROUND_MAX_VMS_PER_CLIENT"
@@ -54,11 +56,19 @@ const (
 	maxProxyHops   = 10
 )
 
+// accelerators are the values localqemu accepts. It checks them again; they
+// are checked here too so a typo is reported with the setting's name.
+var accelerators = []string{"tcg", "kvm", "hvf"}
+
 type Config struct {
 	ListenAddr string
 	ImagePath  string
 	QEMUBin    string
 	VMMemoryMB int
+
+	// QEMUAccel is "", "tcg", "kvm" or "hvf"; empty leaves the choice to QEMU,
+	// which picks tcg. kvm needs Linux with /dev/kvm, which Validate checks.
+	QEMUAccel string
 
 	// MaxSessions is how many VMs may exist at once. MaxVMsPerClient is how
 	// many of them one client (see TrustedProxyHops) may hold.
@@ -96,6 +106,7 @@ func Load(lookup Lookup) (Config, error) {
 		ListenAddr:  l.str(EnvAddr, defaultAddr),
 		ImagePath:   l.str(EnvImage, defaultImage),
 		QEMUBin:     l.str(EnvQEMUBin, defaultQEMUBin),
+		QEMUAccel:   l.oneOf(EnvQEMUAccel, "", accelerators),
 		VMMemoryMB:  l.intInRange(EnvVMMemoryMB, defaultVMMemoryMB, 1, maxVMMemoryMB),
 		MaxSessions: l.intInRange(EnvMaxSessions, defaultMaxSessions, 1, maxMaxSessions),
 
@@ -162,6 +173,15 @@ func (c *Config) Validate() error {
 		c.QEMUBin = bin
 	}
 
+	// Without this, a missing or unwritable /dev/kvm (in a container: no
+	// --device, or no --group-add for its group) only shows up as the first
+	// user's VM failing to start.
+	if c.QEMUAccel == "kvm" {
+		if err := checkReadWritable(kvmDevice); err != nil {
+			errs = append(errs, fmt.Errorf("%s=%q: %w", EnvQEMUAccel, c.QEMUAccel, err))
+		}
+	}
+
 	return errors.Join(errs...)
 }
 
@@ -183,6 +203,7 @@ func (c Config) LogValue() slog.Value {
 		slog.String("addr", c.ListenAddr),
 		slog.String("image", c.ImagePath),
 		slog.String("qemu", c.QEMUBin),
+		slog.String("qemu_accel", c.QEMUAccel),
 		slog.Int("vm_memory_mb", c.VMMemoryMB),
 		slog.Int("max_sessions", c.MaxSessions),
 		slog.Int("max_vms_per_client", c.MaxVMsPerClient),
@@ -194,6 +215,17 @@ func (c Config) LogValue() slog.Value {
 		slog.Int("create_limit_per_minute", c.CreateLimitPerMinute),
 		slog.Int("trusted_proxy_hops", c.TrustedProxyHops),
 	)
+}
+
+// kvmDevice is a variable so tests can point it at a file of their own.
+var kvmDevice = "/dev/kvm"
+
+func checkReadWritable(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0) //nolint:gosec // G304: path is kvmDevice, not user input
+	if err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 func checkReadableFile(path string) error {
@@ -227,6 +259,20 @@ func (l *loader) str(key, def string) string {
 		}
 	}
 	return def
+}
+
+// oneOf reads a value that must be one of allowed, ignoring case.
+func (l *loader) oneOf(key, def string, allowed []string) string {
+	raw := l.str(key, "")
+	if raw == "" {
+		return def
+	}
+	v := strings.ToLower(raw)
+	if !slices.Contains(allowed, v) {
+		l.fail(key, raw, "must be one of "+strings.Join(allowed, ", "))
+		return def
+	}
+	return v
 }
 
 func (l *loader) intInRange(key string, def, lo, hi int) int {
