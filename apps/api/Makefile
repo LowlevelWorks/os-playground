@@ -10,6 +10,7 @@ ISO         ?= ../../../my-os/build/os.iso
 ISO_ABS     := $(abspath $(ISO))
 BOOT_MARKER ?= x86_64 Kernel
 BIN         := bin/server
+HOST_GOOS   := $(shell go env GOOS)
 TOOLS       := $(CURDIR)/.tools
 
 # Keep GOLANGCI_LINT_VERSION in sync with `version:` of golangci-lint-action in ci.yml.
@@ -46,6 +47,10 @@ test-integration: check-iso ## Boot the real OS in QEMU and check the console
 
 lint: $(GOLANGCI_LINT) ## Run linters and format checks (golangci-lint)
 	$(GOLANGCI_LINT) run
+ifneq ($(HOST_GOOS),linux)
+	@# Production runs on Linux: also lint the linux-only files this host skips.
+	GOOS=linux $(GOLANGCI_LINT) run
+endif
 
 lint-fix: $(GOLANGCI_LINT) ## Run linters and apply safe auto-fixes
 	$(GOLANGCI_LINT) run --fix

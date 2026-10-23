@@ -19,6 +19,7 @@ func setProcAttr(cmd *exec.Cmd) {
 	}
 
 	cmd.SysProcAttr.Setpgid = true
+	setPdeathsig(cmd)
 }
 
 // killGroup SIGKILLs the whole process group. Called by exec only while the
