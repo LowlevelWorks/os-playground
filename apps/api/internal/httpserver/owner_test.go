@@ -80,7 +80,7 @@ func TestWSToken(t *testing.T) {
 func TestCreateWithoutAValidTokenIs401(t *testing.T) {
 	a := newAPI(t, 2)
 	for _, token := range []string{"", "short", tokenA + "x"} {
-		rec := a.doAs(token, "", "POST", "/vms")
+		rec := a.doAs(token, "", "POST", "/api/vms")
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("token %q: status = %d, want 401", token, rec.Code)
 		}
@@ -101,15 +101,15 @@ func TestCreateWithoutAValidTokenIs401(t *testing.T) {
 // which IDs exist.
 func TestAnotherOwnersVMLooksExactlyLikeNoVM(t *testing.T) {
 	a := newAPI(t, 2)
-	id := decode(t, a.do("POST", "/vms"))["id"].(string)
+	id := decode(t, a.do("POST", "/api/vms"))["id"].(string)
 
 	for _, method := range []string{"GET", "DELETE"} {
-		want := a.do(method, "/vms/vm-0000000000000000000000")
+		want := a.do(method, "/api/vms/vm-0000000000000000000000")
 		if want.Code != http.StatusNotFound {
 			t.Fatalf("%s of a missing VM = %d, want 404", method, want.Code)
 		}
 		for _, token := range []string{tokenB, "", "short"} {
-			got := a.doAs(token, "", method, "/vms/"+id)
+			got := a.doAs(token, "", method, "/api/vms/"+id)
 			if got.Code != want.Code || got.Body.String() != want.Body.String() ||
 				!reflect.DeepEqual(got.Header(), want.Header()) {
 				t.Errorf("%s as %q = %d %q %v; want what a missing VM gets: %d %q %v", method, token,
@@ -121,7 +121,7 @@ func TestAnotherOwnersVMLooksExactlyLikeNoVM(t *testing.T) {
 	if a.fake.Len() != 1 {
 		t.Fatal("another owner's DELETE removed the VM")
 	}
-	if rec := a.do("GET", "/vms/"+id); rec.Code != http.StatusOK {
+	if rec := a.do("GET", "/api/vms/"+id); rec.Code != http.StatusOK {
 		t.Fatalf("the owner's GET = %d, want 200", rec.Code)
 	}
 }
@@ -129,7 +129,7 @@ func TestAnotherOwnersVMLooksExactlyLikeNoVM(t *testing.T) {
 func TestQuotaIs409AndSaysWhoseVMItIs(t *testing.T) {
 	a := newQuotaAPI(t, 4, 1)
 	const here, elsewhere = "203.0.113.1:1000", "198.51.100.7:1000"
-	id := decode(t, a.doAs(tokenA, here, "POST", "/vms"))["id"].(string)
+	id := decode(t, a.doAs(tokenA, here, "POST", "/api/vms"))["id"].(string)
 
 	tests := []struct {
 		name, token, remote string
@@ -141,7 +141,7 @@ func TestQuotaIs409AndSaysWhoseVMItIs(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			rec := a.doAs(tt.token, tt.remote, "POST", "/vms")
+			rec := a.doAs(tt.token, tt.remote, "POST", "/api/vms")
 			if rec.Code != http.StatusConflict {
 				t.Fatalf("status = %d, want 409", rec.Code)
 			}
@@ -154,7 +154,7 @@ func TestQuotaIs409AndSaysWhoseVMItIs(t *testing.T) {
 		})
 	}
 
-	if rec := a.doAs(tokenB, elsewhere, "POST", "/vms"); rec.Code != http.StatusCreated {
+	if rec := a.doAs(tokenB, elsewhere, "POST", "/api/vms"); rec.Code != http.StatusCreated {
 		t.Fatalf("another address = %d, want 201", rec.Code)
 	}
 	if a.fake.Len() != 2 {
@@ -191,7 +191,7 @@ func dialWS(t *testing.T, url string, protocols []string) (*websocket.Conn, int)
 
 func TestTerminalChecksTheOwnerBeforeUpgrading(t *testing.T) {
 	a := newAPI(t, 2)
-	id := decode(t, a.do("POST", "/vms"))["id"].(string)
+	id := decode(t, a.do("POST", "/api/vms"))["id"].(string)
 	base := wsAPI(t, a)
 
 	refused := []struct {
@@ -205,16 +205,16 @@ func TestTerminalChecksTheOwnerBeforeUpgrading(t *testing.T) {
 	}
 	for _, tt := range refused {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, status := dialWS(t, base+"/ws/vms/"+id, tt.protocols); status != http.StatusNotFound {
+			if _, status := dialWS(t, base+"/api/ws/vms/"+id, tt.protocols); status != http.StatusNotFound {
 				t.Fatalf("dial = %d, want 404", status)
 			}
 		})
 	}
-	if _, status := dialWS(t, base+"/ws/vms/vm-0000000000000000000000", wsOffer(tokenA)); status != http.StatusNotFound {
+	if _, status := dialWS(t, base+"/api/ws/vms/vm-0000000000000000000000", wsOffer(tokenA)); status != http.StatusNotFound {
 		t.Fatalf("dial to a missing VM = %d, want 404", status)
 	}
 
-	c, _ := dialWS(t, base+"/ws/vms/"+id, wsOffer(tokenA))
+	c, _ := dialWS(t, base+"/api/ws/vms/"+id, wsOffer(tokenA))
 	if c == nil {
 		t.Fatal("the owner's dial was refused")
 	}
@@ -227,23 +227,23 @@ func TestTerminalChecksTheOwnerBeforeUpgrading(t *testing.T) {
 // may record a token, its hash, or the headers that carry them.
 func TestTokensNeverReachTheLogs(t *testing.T) {
 	a := newQuotaAPI(t, 4, 1)
-	id := decode(t, a.do("POST", "/vms"))["id"].(string)
+	id := decode(t, a.do("POST", "/api/vms"))["id"].(string)
 
-	a.do("POST", "/vms")                     // 409, yours
-	a.doAs(tokenB, "", "POST", "/vms")       // 409, not yours
-	a.doAs("short", "", "POST", "/vms")      // 401
-	a.do("GET", "/vms/"+id)                  // 200
-	a.doAs(tokenB, "", "GET", "/vms/"+id)    // 404
-	a.doAs(tokenB, "", "DELETE", "/vms/"+id) // 404
+	a.do("POST", "/api/vms")                     // 409, yours
+	a.doAs(tokenB, "", "POST", "/api/vms")       // 409, not yours
+	a.doAs("short", "", "POST", "/api/vms")      // 401
+	a.do("GET", "/api/vms/"+id)                  // 200
+	a.doAs(tokenB, "", "GET", "/api/vms/"+id)    // 404
+	a.doAs(tokenB, "", "DELETE", "/api/vms/"+id) // 404
 
 	base := wsAPI(t, a)
-	dialWS(t, base+"/ws/vms/"+id, wsOffer(tokenB)) // 404
-	if c, _ := dialWS(t, base+"/ws/vms/"+id, wsOffer(tokenA)); c != nil {
-		dialWS(t, base+"/ws/vms/"+id, wsOffer(tokenA)) // 409, already attached
+	dialWS(t, base+"/api/ws/vms/"+id, wsOffer(tokenB)) // 404
+	if c, _ := dialWS(t, base+"/api/ws/vms/"+id, wsOffer(tokenA)); c != nil {
+		dialWS(t, base+"/api/ws/vms/"+id, wsOffer(tokenA)) // 409, already attached
 		c.Close(websocket.StatusNormalClosure, "")
 	}
 
-	if rec := a.do("DELETE", "/vms/"+id); rec.Code != http.StatusNoContent {
+	if rec := a.do("DELETE", "/api/vms/"+id); rec.Code != http.StatusNoContent {
 		t.Fatalf("DELETE = %d", rec.Code)
 	}
 

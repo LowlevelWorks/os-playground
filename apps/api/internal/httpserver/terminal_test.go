@@ -99,7 +99,7 @@ func newEnv(t *testing.T) *env {
 }
 
 func (e *env) url(id string) string {
-	return "ws" + strings.TrimPrefix(e.srv.URL, "http") + "/ws/vms/" + id
+	return "ws" + strings.TrimPrefix(e.srv.URL, "http") + "/api/ws/vms/" + id
 }
 
 // dial opens a terminal as tokenA's owner. origin may be empty, as for a
@@ -219,7 +219,7 @@ func (s stubProvider) Console(context.Context, string, session.Owner) (io.ReadWr
 
 // attachRequest is a WebSocket attach request that gets past the token check.
 func attachRequest(id string) *http.Request {
-	r := httptest.NewRequest("GET", "/ws/vms/"+id, nil)
+	r := httptest.NewRequest("GET", "/api/ws/vms/"+id, nil)
 	r.Header.Set("Sec-WebSocket-Protocol", strings.Join(wsOffer(tokenA), ", "))
 	return r
 }
@@ -393,7 +393,7 @@ func TestFailedUpgradeFreesTheConsole(t *testing.T) {
 
 	// A plain request with the right offer, but no upgrade headers: the
 	// console is attached, then the upgrade fails.
-	req, _ := http.NewRequestWithContext(t.Context(), "GET", e.srv.URL+"/ws/vms/"+vmID, nil)
+	req, _ := http.NewRequestWithContext(t.Context(), "GET", e.srv.URL+"/api/ws/vms/"+vmID, nil)
 	req.Header.Set("Sec-WebSocket-Protocol", strings.Join(wsOffer(tokenA), ", "))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -463,7 +463,7 @@ func TestRequestsDuringShutdownDoNotRaceOrLeak(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			req, _ := http.NewRequestWithContext(t.Context(), "GET", e.srv.URL+"/ws/vms/"+vmID, nil)
+			req, _ := http.NewRequestWithContext(t.Context(), "GET", e.srv.URL+"/api/ws/vms/"+vmID, nil)
 			req.Header.Set("Sec-WebSocket-Protocol", strings.Join(wsOffer(tokenA), ", "))
 			resp, err := http.DefaultClient.Do(req)
 			if err == nil {
