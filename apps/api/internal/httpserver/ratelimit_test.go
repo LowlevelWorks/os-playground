@@ -67,9 +67,9 @@ func TestTooManyRequestsGets429WithRetryAfter(t *testing.T) {
 		return rec
 	}
 
-	do("/vms/x", "203.0.113.1:1111")
-	do("/vms/x", "203.0.113.1:2222") // another port, same client
-	rec := do("/vms/x", "203.0.113.1:3333")
+	do("/api/vms/x", "203.0.113.1:1111")
+	do("/api/vms/x", "203.0.113.1:2222") // another port, same client
+	rec := do("/api/vms/x", "203.0.113.1:3333")
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", rec.Code)
 	}
@@ -83,7 +83,7 @@ func TestTooManyRequestsGets429WithRetryAfter(t *testing.T) {
 	if rec := do("/healthz", "203.0.113.1:4444"); rec.Code != http.StatusOK {
 		t.Errorf("/healthz = %d; health checks must not be limited", rec.Code)
 	}
-	if rec := do("/vms/x", "198.51.100.7:1111"); rec.Code != http.StatusOK {
+	if rec := do("/api/vms/x", "198.51.100.7:1111"); rec.Code != http.StatusOK {
 		t.Errorf("another client = %d, want 200", rec.Code)
 	}
 }
@@ -100,14 +100,14 @@ func TestCreatingVMsHasItsOwnStricterLimit(t *testing.T) {
 	}
 
 	for i := range 2 {
-		if rec := do("POST", "/vms"); rec.Code != http.StatusCreated {
+		if rec := do("POST", "/api/vms"); rec.Code != http.StatusCreated {
 			t.Fatalf("create %d = %d %s", i, rec.Code, rec.Body)
 		}
 	}
-	if rec := do("POST", "/vms"); rec.Code != http.StatusTooManyRequests {
+	if rec := do("POST", "/api/vms"); rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("third create = %d, want 429", rec.Code)
 	}
-	if rec := do("GET", "/vms/nope"); rec.Code != http.StatusNotFound {
+	if rec := do("GET", "/api/vms/nope"); rec.Code != http.StatusNotFound {
 		t.Errorf("other requests were refused too: %d", rec.Code)
 	}
 }

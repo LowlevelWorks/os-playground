@@ -136,7 +136,7 @@ func rateLimit(limits RateLimits, next http.Handler) http.Handler {
 			tooManyRequests(w, wait)
 			return
 		}
-		if r.Method == http.MethodPost && r.URL.Path == "/vms" {
+		if r.Method == http.MethodPost && r.URL.Path == apiPrefix+"/vms" {
 			if ok, wait := create.allow(client); !ok {
 				tooManyRequests(w, wait)
 				return

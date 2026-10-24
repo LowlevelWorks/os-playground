@@ -85,7 +85,7 @@ func (h *VMHandler) Create(w http.ResponseWriter, r *http.Request, o session.Own
 		return
 	}
 
-	w.Header().Set("Location", "/vms/"+v.ID)
+	w.Header().Set("Location", apiPrefix+"/vms/"+v.ID)
 	writeJSON(w, http.StatusCreated, toResponse(v))
 }
 

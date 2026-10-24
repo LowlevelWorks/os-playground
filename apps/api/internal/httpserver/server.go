@@ -30,18 +30,16 @@ func NewServer(manager VMManager, allowedOrigins []string, limits RateLimits, lo
 	vmRoutes(mux, vms, limits.TrustedProxyHops)
 	// OPTIONS preflight for every /vms* path. The CORS middleware answers it;
 	// without a route the mux would return 405.
-	mux.HandleFunc("OPTIONS /vms", func(w http.ResponseWriter, r *http.Request) {})
-	mux.HandleFunc("OPTIONS /vms/{id}", func(w http.ResponseWriter, r *http.Request) {})
+	mux.HandleFunc("OPTIONS "+apiPrefix+"/vms", func(w http.ResponseWriter, r *http.Request) {})
+	mux.HandleFunc("OPTIONS "+apiPrefix+"/vms/{id}", func(w http.ResponseWriter, r *http.Request) {})
 	terminalRoute(mux, terminal, limits.TrustedProxyHops)
-
-	apiMux := http.NewServeMux()
-	apiMux.Handle("/api/", http.StripPrefix("/api", mux))
-	apiMux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+	// Outside the prefix: probes hit it directly, not through the web proxy.
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "ok\n")
 	})
 
 	// Outermost first: the access log must see what recovery turned a panic into.
-	var h http.Handler = apiMux
+	var h http.Handler = mux
 	h = rateLimit(limits, h)
 	h = cors(allowedOrigins, h)
 	h = recoverPanic(log, h)
@@ -49,18 +47,23 @@ func NewServer(manager VMManager, allowedOrigins []string, limits RateLimits, lo
 	return &Server{handler: h, terminal: terminal}
 }
 
+// apiPrefix is where every API route lives. Routes are registered with it
+// rather than behind http.StripPrefix, which hands the inner mux a copy of the
+// request: the access log would then never see the matched pattern.
+const apiPrefix = "/api"
+
 // vmRoutes mounts the REST endpoints. Every one goes through withOwner, so no
 // handler runs without a verified owner. Tests mount routes with this too.
 func vmRoutes(mux *http.ServeMux, vms *VMHandler, proxyHops int) {
-	mux.HandleFunc("POST /vms", withOwner(bearerToken, unauthorized, proxyHops, vms.Create))
-	mux.HandleFunc("GET /vms/{id}", withOwner(bearerToken, vmNotFound, proxyHops, vms.Get))
-	mux.HandleFunc("DELETE /vms/{id}", withOwner(bearerToken, vmNotFound, proxyHops, vms.Delete))
+	mux.HandleFunc("POST "+apiPrefix+"/vms", withOwner(bearerToken, unauthorized, proxyHops, vms.Create))
+	mux.HandleFunc("GET "+apiPrefix+"/vms/{id}", withOwner(bearerToken, vmNotFound, proxyHops, vms.Get))
+	mux.HandleFunc("DELETE "+apiPrefix+"/vms/{id}", withOwner(bearerToken, vmNotFound, proxyHops, vms.Delete))
 }
 
 // terminalRoute mounts the console WebSocket: shutdown check first, then the
 // owner, then the attach.
 func terminalRoute(mux *http.ServeMux, terminal *TerminalHandler, proxyHops int) {
-	mux.Handle("GET /ws/vms/{id}", terminal.admit(withOwner(wsToken, wsNotFound, proxyHops, terminal.Serve)))
+	mux.Handle("GET "+apiPrefix+"/ws/vms/{id}", terminal.admit(withOwner(wsToken, wsNotFound, proxyHops, terminal.Serve)))
 }
 
 // originHosts returns the host:port part of each origin, which is the form

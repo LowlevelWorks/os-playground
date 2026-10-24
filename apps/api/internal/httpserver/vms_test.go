@@ -108,7 +108,7 @@ func wantKeys(t *testing.T, m map[string]any) {
 func TestCreateReturnsTheNewVM(t *testing.T) {
 	a := newAPI(t, 2)
 
-	rec := a.do("POST", "/vms")
+	rec := a.do("POST", "/api/vms")
 
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201", rec.Code)
@@ -122,19 +122,19 @@ func TestCreateReturnsTheNewVM(t *testing.T) {
 	if id == "" {
 		t.Fatalf("no id in the body: %v", body)
 	}
-	if loc := rec.Header().Get("Location"); loc != "/vms/"+id {
+	if loc := rec.Header().Get("Location"); loc != "/api/vms/"+id {
 		t.Errorf("Location = %q, want /vms/%s", loc, id)
 	}
 }
 
 func TestGetReturnsTheVMAndNothingAboutTheHost(t *testing.T) {
 	a := newAPI(t, 2)
-	id := decode(t, a.do("POST", "/vms"))["id"].(string)
+	id := decode(t, a.do("POST", "/api/vms"))["id"].(string)
 	if err := a.fake.Finish(id, vm.StatusFailed, "open /secret/qemu/path: permission denied"); err != nil {
 		t.Fatal(err)
 	}
 
-	rec := a.do("GET", "/vms/"+id)
+	rec := a.do("GET", "/api/vms/"+id)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -152,7 +152,7 @@ func TestGetReturnsTheVMAndNothingAboutTheHost(t *testing.T) {
 func TestUnknownVMIs404WithAJSONError(t *testing.T) {
 	a := newAPI(t, 2)
 
-	rec := a.do("GET", "/vms/no-such-vm")
+	rec := a.do("GET", "/api/vms/no-such-vm")
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
@@ -164,10 +164,10 @@ func TestUnknownVMIs404WithAJSONError(t *testing.T) {
 
 func TestNoCapacityIs503WithRetryAfter(t *testing.T) {
 	a := newAPI(t, 2)
-	a.do("POST", "/vms")
-	a.do("POST", "/vms")
+	a.do("POST", "/api/vms")
+	a.do("POST", "/api/vms")
 
-	rec := a.do("POST", "/vms")
+	rec := a.do("POST", "/api/vms")
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
@@ -182,26 +182,26 @@ func TestNoCapacityIs503WithRetryAfter(t *testing.T) {
 
 func TestDeleteFreesTheSlotAndThenTheVMIsGone(t *testing.T) {
 	a := newAPI(t, 1)
-	id := decode(t, a.do("POST", "/vms"))["id"].(string)
+	id := decode(t, a.do("POST", "/api/vms"))["id"].(string)
 
-	if rec := a.do("DELETE", "/vms/"+id); rec.Code != http.StatusNoContent || rec.Body.Len() != 0 {
+	if rec := a.do("DELETE", "/api/vms/"+id); rec.Code != http.StatusNoContent || rec.Body.Len() != 0 {
 		t.Fatalf("DELETE = %d with body %q, want 204 and none", rec.Code, rec.Body)
 	}
-	if rec := a.do("DELETE", "/vms/"+id); rec.Code != http.StatusNotFound {
+	if rec := a.do("DELETE", "/api/vms/"+id); rec.Code != http.StatusNotFound {
 		t.Fatalf("second DELETE = %d, want 404", rec.Code)
 	}
-	if rec := a.do("GET", "/vms/"+id); rec.Code != http.StatusNotFound {
+	if rec := a.do("GET", "/api/vms/"+id); rec.Code != http.StatusNotFound {
 		t.Errorf("GET after DELETE = %d, want 404", rec.Code)
 	}
-	if rec := a.do("POST", "/vms"); rec.Code != http.StatusCreated {
+	if rec := a.do("POST", "/api/vms"); rec.Code != http.StatusCreated {
 		t.Errorf("POST after DELETE = %d, want 201: the slot was not freed", rec.Code)
 	}
 }
 
 func TestWrongMethodIs405(t *testing.T) {
 	a := newAPI(t, 1)
-	if rec := a.do("PUT", "/vms"); rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("PUT /vms = %d, want 405", rec.Code)
+	if rec := a.do("PUT", "/api/vms"); rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("PUT /api/vms = %d, want 405", rec.Code)
 	}
 }
 
@@ -227,9 +227,9 @@ func (b brokenVMs) Delete(context.Context, string, session.Owner) error { return
 // the client in detail. It goes to the log.
 func TestUnexpectedFailuresAre500AndLoggedNotShown(t *testing.T) {
 	tests := []struct{ name, method, path string }{
-		{"create", "POST", "/vms"},
-		{"get", "GET", "/vms/vm-1"},
-		{"delete", "DELETE", "/vms/vm-1"},
+		{"create", "POST", "/api/vms"},
+		{"get", "GET", "/api/vms/vm-1"},
+		{"delete", "DELETE", "/api/vms/vm-1"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -259,7 +259,7 @@ func TestUnexpectedFailuresAre500AndLoggedNotShown(t *testing.T) {
 func TestNewVMHandlerWithoutLoggerDoesNotPanic(t *testing.T) {
 	h := NewVMHandler(brokenVMs{errors.New("boom")}, nil)
 	rec := httptest.NewRecorder()
-	h.Create(rec, httptest.NewRequest("POST", "/vms", nil), session.Owner{Hash: hashToken(tokenA)})
+	h.Create(rec, httptest.NewRequest("POST", "/api/vms", nil), session.Owner{Hash: hashToken(tokenA)})
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d", rec.Code)
 	}
@@ -274,7 +274,7 @@ func TestServerShutdownReachesTheTerminalHandler(t *testing.T) {
 		t.Fatalf("Shutdown = %v", err)
 	}
 
-	if rec := a.do("GET", "/ws/vms/anything"); rec.Code != http.StatusServiceUnavailable {
+	if rec := a.do("GET", "/api/ws/vms/anything"); rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("terminal route after Shutdown = %d, want 503", rec.Code)
 	}
 }
