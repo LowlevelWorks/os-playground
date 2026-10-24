@@ -15,7 +15,7 @@ export function wsBase(): string {
   const configured = process.env.NEXT_PUBLIC_API_WS_URL;
   if (configured) return configured.replace(/\/+$/, "");
   const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-  return `${scheme}://${window.location.hostname}:8080/api`;
+  return `${scheme}://${window.location.host}/api`;
 }
 
 /** What the Enter key sends. Terminals send \r; some OSes want \n. */
