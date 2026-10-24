@@ -33,12 +33,15 @@ func NewServer(manager VMManager, allowedOrigins []string, limits RateLimits, lo
 	mux.HandleFunc("OPTIONS /vms", func(w http.ResponseWriter, r *http.Request) {})
 	mux.HandleFunc("OPTIONS /vms/{id}", func(w http.ResponseWriter, r *http.Request) {})
 	terminalRoute(mux, terminal, limits.TrustedProxyHops)
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+
+	apiMux := http.NewServeMux()
+	apiMux.Handle("/api/", http.StripPrefix("/api", mux))
+	apiMux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "ok\n")
 	})
 
 	// Outermost first: the access log must see what recovery turned a panic into.
-	var h http.Handler = mux
+	var h http.Handler = apiMux
 	h = rateLimit(limits, h)
 	h = cors(allowedOrigins, h)
 	h = recoverPanic(log, h)
