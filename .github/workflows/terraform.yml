@@ -1,0 +1,152 @@
+name: Terraform
+
+# Pull requests get a plan for every stack, shown in the run summary. Merging
+# to main applies them in order: global and staging first, then prod after a
+# second approval. Both apply jobs use the "infrastructure" environment, which
+# requires a reviewer and is the only thing the apply role trusts.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - '.github/workflows/terraform.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - '.github/workflows/terraform.yml'
+
+permissions:
+  contents: read
+
+# Applies never overlap; a newer plan on the same PR replaces an older one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TF_VERSION: 1.14.0
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: 'false'
+  AWS_REGION: ap-southeast-2
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - run: terraform fmt -check -recursive -diff infra
+
+  plan:
+    if: github.event_name == 'pull_request'
+    needs: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: [global, envs/staging, envs/prod]
+    defaults:
+      run:
+        working-directory: infra/${{ matrix.stack }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - run: terraform init -lockfile=readonly
+      - run: terraform validate -no-color
+
+      - name: Plan
+        env:
+          STACK: ${{ matrix.stack }}
+        run: |
+          terraform plan -no-color -lock-timeout=5m -out=tfplan
+          {
+            echo "### \`$STACK\`"
+            echo '```'
+            terraform show -no-color tfplan | tail -c 60000
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  apply-nonprod:
+    if: github.event_name == 'push'
+    needs: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: infrastructure
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 3600
+
+      # Plan and apply that exact plan, so the log shows what changed.
+      - name: Apply global, then staging
+        run: |
+          for stack in global envs/staging; do
+            echo "::group::$stack"
+            terraform -chdir="infra/$stack" init -lockfile=readonly
+            terraform -chdir="infra/$stack" plan -no-color -lock-timeout=5m -out=tfplan
+            terraform -chdir="infra/$stack" apply -no-color -lock-timeout=5m tfplan
+            echo "::endgroup::"
+          done
+
+  apply-prod:
+    needs: apply-nonprod
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: infrastructure
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 3600
+
+      - name: Apply prod
+        working-directory: infra/envs/prod
+        run: |
+          terraform init -lockfile=readonly
+          terraform plan -no-color -lock-timeout=5m -out=tfplan
+          terraform apply -no-color -lock-timeout=5m tfplan

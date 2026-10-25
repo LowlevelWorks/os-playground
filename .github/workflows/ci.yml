@@ -137,6 +137,21 @@ jobs:
       - run: pnpm test
       - run: pnpm build
 
+      # The site calls the API on its own origin; a dev URL baked in by a
+      # stray env file would send every visitor to their own localhost.
+      - name: No dev URLs in the build
+        run: '! grep -rl "localhost:8080" out/'
+
+      # Deploys ship these exact files to staging and then prod.
+      - name: Upload site
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-out
+          path: apps/web/out
+          retention-days: 30
+          if-no-files-found: error
+
   ci-ok:
     name: ci-ok
     if: always()
@@ -147,3 +162,89 @@ jobs:
       - name: Fail if any job failed or was canceled
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
         run: exit 1
+
+  # ---- Release: main only, after every check above has passed ----------------
+
+  # Built once; staging and prod run this same image.
+  build-image:
+    needs: [changes, ci-ok]
+    if: github.event_name == 'push' && needs.changes.outputs.api == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image: ${{ steps.image.outputs.ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_BUILD_ROLE_ARN }}
+          aws-region: ap-southeast-2
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      # Tags are immutable, so a re-run of the same commit reuses its image.
+      - name: Check for an existing image
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          echo "ref=$REGISTRY/os-playground-api:$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          if aws ecr describe-images --repository-name os-playground-api \
+               --image-ids "imageTag=$GITHUB_SHA" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        if: steps.image.outputs.exists == 'false'
+
+      - name: Build and push
+        if: steps.image.outputs.exists == 'false'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: apps/api
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ steps.image.outputs.ref }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+  # build-image is skipped when only the web app changed, so these jobs accept
+  # "skipped" for it and decide what to ship from the change filter.
+  deploy-staging:
+    needs: [changes, ci-ok, build-image]
+    if: >-
+      !cancelled() && github.event_name == 'push' && needs.ci-ok.result == 'success'
+      && contains(fromJSON('["success", "skipped"]'), needs.build-image.result)
+      && (needs.changes.outputs.api == 'true' || needs.changes.outputs.web == 'true')
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: staging
+      image: ${{ needs.build-image.outputs.image }}
+      deploy_web: ${{ needs.changes.outputs.web == 'true' }}
+
+  # The prod environment requires a reviewer, so this waits for approval.
+  deploy-prod:
+    needs: [changes, build-image, deploy-staging]
+    if: >-
+      !cancelled() && needs.deploy-staging.result == 'success'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: prod
+      image: ${{ needs.build-image.outputs.image }}
+      deploy_web: ${{ needs.changes.outputs.web == 'true' }}

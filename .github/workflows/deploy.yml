@@ -1,0 +1,149 @@
+name: Deploy
+
+# Deploys one environment. Called by CI once for staging and then, after
+# approval, for prod with the same image and the same site files. Everything
+# environment-specific comes from the GitHub environment's variables, which
+# are the outputs of that environment's Terraform stack.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: staging or prod (a GitHub environment)
+        required: true
+        type: string
+      image:
+        description: Full image reference to roll out; empty to leave the API alone
+        required: false
+        type: string
+        default: ''
+      deploy_web:
+        description: Upload the web-out artifact of this run
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-2
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.SITE_URL }}
+    permissions:
+      contents: read
+      id-token: write
+    # One rollout per environment at a time; a later one waits.
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      IMAGE: ${{ inputs.image }}
+      SITE_URL: ${{ vars.SITE_URL }}
+      WEB_BUCKET: ${{ vars.WEB_BUCKET }}
+      DISTRIBUTION_ID: ${{ vars.DISTRIBUTION_ID }}
+      ASG_NAME: ${{ vars.ASG_NAME }}
+      IMAGE_PARAMETER: ${{ vars.IMAGE_PARAMETER }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ---- Site ------------------------------------------------------------
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: inputs.deploy_web
+        with:
+          name: web-out
+          path: out
+
+      # Hashed assets first, so the new HTML never points at files not yet uploaded.
+      - name: Upload site
+        if: inputs.deploy_web
+        run: |
+          aws s3 sync out/_next/static "s3://$WEB_BUCKET/_next/static" \
+            --cache-control "public,max-age=31536000,immutable"
+          aws s3 sync out/ "s3://$WEB_BUCKET/" --delete \
+            --exclude "_next/static/*" --cache-control "no-cache"
+          aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" \
+            --paths "/*" > /dev/null
+
+      # ---- API ---------------------------------------------------------------
+
+      # The hosts read the image from this parameter when they boot, so a
+      # release is: change the parameter, then replace every host.
+      - name: Point the environment at the new image
+        id: release
+        if: inputs.image != ''
+        run: |
+          repo=${IMAGE#*/}; repo=${repo%%:*}
+          aws ecr describe-images --repository-name "$repo" --image-ids "imageTag=${IMAGE##*:}" > /dev/null
+
+          previous=$(aws ssm get-parameter --name "$IMAGE_PARAMETER" --query Parameter.Value --output text)
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+          echo "Image: $previous -> $IMAGE"
+          aws ssm put-parameter --name "$IMAGE_PARAMETER" --value "$IMAGE" --overwrite > /dev/null
+
+      - name: Replace hosts
+        id: refresh
+        if: inputs.image != ''
+        timeout-minutes: 30
+        run: |
+          # The launch template has not changed, so every host must be
+          # replaced (SkipMatching off). New hosts become healthy before old
+          # ones are drained.
+          id=$(aws autoscaling start-instance-refresh --auto-scaling-group-name "$ASG_NAME" \
+            --preferences '{"MinHealthyPercentage":100,"MaxHealthyPercentage":200,"InstanceWarmup":300,"SkipMatching":false}' \
+            --query InstanceRefreshId --output text)
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          while :; do
+            read -r status pct < <(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" --instance-refresh-ids "$id" \
+              --query 'InstanceRefreshes[0].[Status,PercentageComplete]' --output text)
+            echo "$(date -u +%T) $status ${pct}%"
+            case "$status" in
+              Successful) exit 0 ;;
+              Failed|Cancelled|RollbackSuccessful|RollbackFailed) exit 1 ;;
+            esac
+            sleep 20
+          done
+
+      - name: Smoke test
+        if: inputs.image != '' || inputs.deploy_web
+        run: |
+          check() { # expected-status method path
+            for _ in 1 2 3 4 5 6; do
+              got=$(curl -s -o /dev/null -w '%{http_code}' -X "$2" "$SITE_URL$3")
+              [ "$got" = "$1" ] && { echo "ok   $2 $3 -> $got"; return 0; }
+              sleep 10
+            done
+            echo "FAIL $2 $3 -> $got (want $1)"; return 1
+          }
+          check 200 GET /
+          # Reaches the API through CloudFront and the ALB; 401 because there is no token.
+          check 401 POST /api/vms
+
+      # Put the previous image back so hosts the group launches from now on
+      # boot a known-good release, and roll the fleet back onto it.
+      - name: Roll back the API
+        if: failure() && steps.release.outputs.previous != ''
+        env:
+          PREVIOUS: ${{ steps.release.outputs.previous }}
+        run: |
+          aws autoscaling cancel-instance-refresh --auto-scaling-group-name "$ASG_NAME" || true
+          aws ssm put-parameter --name "$IMAGE_PARAMETER" --value "$PREVIOUS" --overwrite > /dev/null
+          for _ in $(seq 1 30); do
+            aws autoscaling start-instance-refresh --auto-scaling-group-name "$ASG_NAME" \
+              --preferences '{"MinHealthyPercentage":100,"MaxHealthyPercentage":200,"InstanceWarmup":300,"SkipMatching":false}' \
+              > /dev/null 2>&1 && { echo "Rolling back to $PREVIOUS"; exit 0; }
+            sleep 10 # the cancelled refresh is still winding down
+          done
+          echo "Could not start the rollback refresh; start one by hand." >&2
+          exit 1

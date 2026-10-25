@@ -1,0 +1,60 @@
+#!/bin/bash
+# Rendered by Terraform (modules/api). cloud-init runs it once, as root, on the
+# first boot of every instance the Auto Scaling group launches.
+set -euxo pipefail
+
+REGION=${region}
+
+dnf install -y docker
+systemctl enable --now docker
+
+# Which image runs is release state, not infrastructure: CI writes it to this
+# parameter and then starts an instance refresh.
+IMAGE=$(aws ssm get-parameter --region "$REGION" --name "${image_parameter}" \
+  --query Parameter.Value --output text)
+REGISTRY=$${IMAGE%%/*}
+
+mkdir -p /opt/os /etc/os-playground
+aws s3 cp "s3://${assets_bucket}/${iso_key}" /opt/os/os.iso --region "$REGION"
+
+TOKEN=$(curl -sfX PUT http://169.254.169.254/latest/api/token \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+INSTANCE_ID=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/instance-id)
+
+# KVM when the instance type provides it (nested virtualization), otherwise
+# software emulation.
+ACCEL=tcg
+KVM_ARGS=()
+if [ -e /dev/kvm ]; then
+  ACCEL=kvm
+  KVM_ARGS=(--device /dev/kvm --group-add "$(stat -c %g /dev/kvm)")
+fi
+
+cat > /etc/os-playground/api.env <<EOF
+PLAYGROUND_QEMU_ACCEL=$ACCEL
+PLAYGROUND_VM_MEMORY_MB=${vm_memory_mb}
+PLAYGROUND_MAX_SESSIONS=${max_sessions}
+PLAYGROUND_ALLOWED_ORIGINS=${allowed_origin}
+PLAYGROUND_TRUSTED_PROXY_HOPS=2
+EOF
+
+aws ecr get-login-password --region "$REGION" \
+  | docker login --username AWS --password-stdin "$REGISTRY"
+
+# The guest runs whatever a visitor types, so the container gets the least it
+# can work with: no capabilities, no privilege escalation, a read-only root.
+# The instance's metadata hop limit is 1, so nothing in the container can
+# reach the instance role's credentials.
+docker run -d --name api --restart unless-stopped -p 8080:8080 \
+  --read-only --tmpfs /tmp \
+  --cap-drop ALL --security-opt no-new-privileges \
+  --pids-limit 1024 \
+  --log-driver awslogs \
+  --log-opt awslogs-region="$REGION" \
+  --log-opt awslogs-group="${log_group}" \
+  --log-opt awslogs-stream="$INSTANCE_ID" \
+  -v /opt/os/os.iso:/opt/os/os.iso:ro \
+  --env-file /etc/os-playground/api.env \
+  "$${KVM_ARGS[@]}" \
+  "$IMAGE"
