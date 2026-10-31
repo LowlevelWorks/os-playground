@@ -20,7 +20,7 @@ type consoleProvider interface {
 	Console(ctx context.Context, id string, o session.Owner) (io.ReadWriteCloser, error)
 }
 
-// TerminalHandler serves GET /ws/vms/{id}: a WebSocket wired to a VM console.
+// TerminalHandler serves GET /ws/playgrounds/{id}: a WebSocket wired to a VM console.
 // It is not an http.Handler: Serve needs an Owner and admit tracks sessions
 // for Shutdown, and terminalRoute puts the two together.
 type TerminalHandler struct {

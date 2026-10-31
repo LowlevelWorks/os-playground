@@ -248,7 +248,7 @@ export class SessionController {
     this.set(run, { kind: "connecting", id });
 
     const open = this.opts.openSocket ?? ((url: string, protocols: string[]) => new WebSocket(url, protocols));
-    const socket = open(`${this.opts.wsBase}/ws/vms/${encodeURIComponent(id)}`, [
+    const socket = open(`${this.opts.wsBase}/ws/playgrounds/${encodeURIComponent(id)}`, [
       WS_PROTOCOL,
       WS_TOKEN_PREFIX + this.token(),
     ]);

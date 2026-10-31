@@ -79,7 +79,7 @@ describe("starting a session", () => {
 
     await t.controller.start();
     expect(t.kinds()).toEqual(["creating", "starting", "connecting"]);
-    expect(t.sockets[0].url).toBe("ws://api.test/ws/vms/vm-1");
+    expect(t.sockets[0].url).toBe("ws://api.test/ws/playgrounds/vm-1");
     expect(t.sockets[0].url).not.toContain(TOKEN);
     expect(t.sockets[0].protocols).toEqual(["os-playground.v1", `token.${TOKEN}`]);
     expect(t.sockets[0].binaryType).toBe("arraybuffer");

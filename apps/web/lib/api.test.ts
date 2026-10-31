@@ -64,7 +64,7 @@ describe("createApi", () => {
     const vm = await api.createVM();
 
     expect(vm).toEqual({ id: "vm-1", status: "starting", created_at: "2026-10-22T06:00:00Z" });
-    expect(calls[0][0]).toBe("/api/vms");
+    expect(calls[0][0]).toBe("/api/playgrounds");
     expect(calls[0][1]?.method).toBe("POST");
   });
 
@@ -77,7 +77,7 @@ describe("createApi", () => {
 
     await api.getVM("a/b");
 
-    expect(seen).toBe("/api/vms/a%2Fb");
+    expect(seen).toBe("/api/playgrounds/a%2Fb");
   });
 
   it("turns an error body into an ApiError with the server's message", async () => {

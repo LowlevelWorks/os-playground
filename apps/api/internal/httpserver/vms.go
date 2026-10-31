@@ -63,7 +63,7 @@ func NewVMHandler(svc vmService, log *slog.Logger) *VMHandler {
 	return &VMHandler{svc: svc, log: log}
 }
 
-// Create handles POST /vms. It takes no body: the server chooses everything.
+// Create handles POST /playgrounds. It takes no body: the server chooses everything.
 func (h *VMHandler) Create(w http.ResponseWriter, r *http.Request, o session.Owner) {
 	v, err := h.svc.Create(r.Context(), o)
 	var quota *session.QuotaError
@@ -85,11 +85,11 @@ func (h *VMHandler) Create(w http.ResponseWriter, r *http.Request, o session.Own
 		return
 	}
 
-	w.Header().Set("Location", apiPrefix+"/vms/"+v.ID)
+	w.Header().Set("Location", apiPrefix+"/playgrounds/"+v.ID)
 	writeJSON(w, http.StatusCreated, toResponse(v))
 }
 
-// Get handles GET /vms/{id}. Another owner's VM is not found, like no VM.
+// Get handles GET /playgrounds/{id}. Another owner's VM is not found, like no VM.
 func (h *VMHandler) Get(w http.ResponseWriter, r *http.Request, o session.Owner) {
 	v, err := h.svc.Get(r.Context(), r.PathValue("id"), o)
 	switch {
@@ -107,7 +107,7 @@ func (h *VMHandler) Get(w http.ResponseWriter, r *http.Request, o session.Owner)
 	writeJSON(w, http.StatusOK, toResponse(v))
 }
 
-// Delete handles DELETE /vms/{id}. A VM that is gone or not the caller's is
+// Delete handles DELETE /playgrounds/{id}. A VM that is gone or not the caller's is
 // not found, as for Get.
 func (h *VMHandler) Delete(w http.ResponseWriter, r *http.Request, o session.Owner) {
 	err := h.svc.Delete(r.Context(), r.PathValue("id"), o)
