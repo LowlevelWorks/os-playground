@@ -19,7 +19,7 @@ type RateLimits struct {
 	RequestsPerSecond int
 	Burst             int
 
-	// CreatesPerMinute applies to POST /vms on top of the above: each one
+	// CreatesPerMinute applies to POST /playgrounds on top of the above: each one
 	// boots a VM, which costs far more than any other request.
 	CreatesPerMinute int
 
@@ -136,7 +136,7 @@ func rateLimit(limits RateLimits, next http.Handler) http.Handler {
 			tooManyRequests(w, wait)
 			return
 		}
-		if r.Method == http.MethodPost && r.URL.Path == apiPrefix+"/vms" {
+		if r.Method == http.MethodPost && r.URL.Path == apiPrefix+"/playgrounds" {
 			if ok, wait := create.allow(client); !ok {
 				tooManyRequests(w, wait)
 				return

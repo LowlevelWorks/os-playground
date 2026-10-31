@@ -69,16 +69,16 @@ export function createApi(
 
   return {
     async createVM(signal) {
-      return readVM(await call("/vms", { method: "POST", signal }));
+      return readVM(await call("/playgrounds", { method: "POST", signal }));
     },
     async getVM(id, signal) {
       return readVM(
-        await call(`/vms/${encodeURIComponent(id)}`, { method: "GET", signal }),
+        await call(`/playgrounds/${encodeURIComponent(id)}`, { method: "GET", signal }),
       );
     },
     async deleteVM(id, signal) {
       try {
-        await call(`/vms/${encodeURIComponent(id)}`, { method: "DELETE", signal });
+        await call(`/playgrounds/${encodeURIComponent(id)}`, { method: "DELETE", signal });
       } catch (err) {
         // Deleting something that is already gone is the outcome we wanted.
         if (err instanceof ApiError && err.status === 404) return;

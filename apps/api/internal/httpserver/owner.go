@@ -106,7 +106,7 @@ func withOwner(read func(*http.Request) (string, bool), refuse http.HandlerFunc,
 	}
 }
 
-// unauthorized refuses POST /vms. It is the one route that says a token is
+// unauthorized refuses POST /playgrounds. It is the one route that says a token is
 // wrong, since there is no VM whose existence that could reveal.
 func unauthorized(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("WWW-Authenticate", "Bearer")

@@ -28,10 +28,10 @@ func NewServer(manager VMManager, allowedOrigins []string, limits RateLimits, lo
 
 	mux := http.NewServeMux()
 	vmRoutes(mux, vms, limits.TrustedProxyHops)
-	// OPTIONS preflight for every /vms* path. The CORS middleware answers it;
+	// OPTIONS preflight for every /playgrounds* path. The CORS middleware answers it;
 	// without a route the mux would return 405.
-	mux.HandleFunc("OPTIONS "+apiPrefix+"/vms", func(w http.ResponseWriter, r *http.Request) {})
-	mux.HandleFunc("OPTIONS "+apiPrefix+"/vms/{id}", func(w http.ResponseWriter, r *http.Request) {})
+	mux.HandleFunc("OPTIONS "+apiPrefix+"/playgrounds", func(w http.ResponseWriter, r *http.Request) {})
+	mux.HandleFunc("OPTIONS "+apiPrefix+"/playgrounds/{id}", func(w http.ResponseWriter, r *http.Request) {})
 	terminalRoute(mux, terminal, limits.TrustedProxyHops)
 	// Outside the prefix: probes hit it directly, not through the web proxy.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -55,15 +55,15 @@ const apiPrefix = "/api"
 // vmRoutes mounts the REST endpoints. Every one goes through withOwner, so no
 // handler runs without a verified owner. Tests mount routes with this too.
 func vmRoutes(mux *http.ServeMux, vms *VMHandler, proxyHops int) {
-	mux.HandleFunc("POST "+apiPrefix+"/vms", withOwner(bearerToken, unauthorized, proxyHops, vms.Create))
-	mux.HandleFunc("GET "+apiPrefix+"/vms/{id}", withOwner(bearerToken, vmNotFound, proxyHops, vms.Get))
-	mux.HandleFunc("DELETE "+apiPrefix+"/vms/{id}", withOwner(bearerToken, vmNotFound, proxyHops, vms.Delete))
+	mux.HandleFunc("POST "+apiPrefix+"/playgrounds", withOwner(bearerToken, unauthorized, proxyHops, vms.Create))
+	mux.HandleFunc("GET "+apiPrefix+"/playgrounds/{id}", withOwner(bearerToken, vmNotFound, proxyHops, vms.Get))
+	mux.HandleFunc("DELETE "+apiPrefix+"/playgrounds/{id}", withOwner(bearerToken, vmNotFound, proxyHops, vms.Delete))
 }
 
 // terminalRoute mounts the console WebSocket: shutdown check first, then the
 // owner, then the attach.
 func terminalRoute(mux *http.ServeMux, terminal *TerminalHandler, proxyHops int) {
-	mux.Handle("GET "+apiPrefix+"/ws/vms/{id}", terminal.admit(withOwner(wsToken, wsNotFound, proxyHops, terminal.Serve)))
+	mux.Handle("GET "+apiPrefix+"/ws/playgrounds/{id}", terminal.admit(withOwner(wsToken, wsNotFound, proxyHops, terminal.Serve)))
 }
 
 // originHosts returns the host:port part of each origin, which is the form

@@ -17,6 +17,7 @@ import (
 
 const (
 	EnvAddr           = "PLAYGROUND_ADDR"
+	EnvMetricsAddr    = "PLAYGROUND_METRICS_ADDR"
 	EnvImage          = "PLAYGROUND_OS_IMAGE"
 	EnvQEMUBin        = "PLAYGROUND_QEMU_BIN"
 	EnvQEMUAccel      = "PLAYGROUND_QEMU_ACCEL"
@@ -37,6 +38,7 @@ const (
 	// Loopback only, so the server is reachable from other machines only when
 	// someone asks for that explicitly with PLAYGROUND_ADDR.
 	defaultAddr         = "127.0.0.1:8080"
+	defaultMetricsAddr  = "127.0.0.1:9090"
 	defaultImage        = "build/os.iso"
 	defaultQEMUBin      = "qemu-system-x86_64"
 	defaultVMMemoryMB   = 128
@@ -62,6 +64,11 @@ var accelerators = []string{"tcg", "kvm", "hvf"}
 
 type Config struct {
 	ListenAddr string
+
+	// MetricsAddr serves Prometheus metrics at /metrics. It is a listener of
+	// its own, never the API's: nothing public should reach it.
+	MetricsAddr string
+
 	ImagePath  string
 	QEMUBin    string
 	VMMemoryMB int
@@ -104,6 +111,7 @@ func Load(lookup Lookup) (Config, error) {
 
 	cfg := Config{
 		ListenAddr:  l.str(EnvAddr, defaultAddr),
+		MetricsAddr: l.str(EnvMetricsAddr, defaultMetricsAddr),
 		ImagePath:   l.str(EnvImage, defaultImage),
 		QEMUBin:     l.str(EnvQEMUBin, defaultQEMUBin),
 		QEMUAccel:   l.oneOf(EnvQEMUAccel, "", accelerators),
@@ -134,6 +142,12 @@ func Load(lookup Lookup) (Config, error) {
 
 	if err := checkListenAddr(cfg.ListenAddr); err != nil {
 		l.fail(EnvAddr, cfg.ListenAddr, err.Error())
+	}
+
+	if err := checkListenAddr(cfg.MetricsAddr); err != nil {
+		l.fail(EnvMetricsAddr, cfg.MetricsAddr, err.Error())
+	} else if cfg.MetricsAddr == cfg.ListenAddr {
+		l.fail(EnvMetricsAddr, cfg.MetricsAddr, "must differ from "+EnvAddr)
 	}
 
 	if raw := l.str(EnvAllowedOrigins, ""); raw != "" {
