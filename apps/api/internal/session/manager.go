@@ -6,6 +6,10 @@
 //
 // The provider has no List and frees a VM's capacity slot only on Delete, so
 // without this bookkeeping a crashed VM would hold its slot forever.
+//
+// Store is the durable record that replaces the Manager's in-memory one (ADR
+// 0010): PostgreSQL in production, MemStore in tests. Both must pass
+// storetest.Run.
 package session
 
 import (
@@ -26,9 +30,11 @@ import (
 const defaultGrace = 30 * time.Second
 
 // ErrQuota matches every *QuotaError.
-var ErrQuota = errors.New("session: per-client VM limit reached")
+var ErrQuota = errors.New("session: quota reached")
 
-// QuotaError is Create refusing a client that already holds its share.
+// QuotaError refuses a new session because the caller's owner or client
+// already holds its share. ClientWide tells which limit was reached; Yours
+// tells whether the caller can resume a session of its own instead.
 type QuotaError struct {
 	// Yours is true when one of those VMs, or a create still in flight,
 	// belongs to the caller's own token.
@@ -36,9 +42,16 @@ type QuotaError struct {
 	// ID is the caller's oldest live VM. It is empty unless Yours, and empty
 	// while the caller's only VM is still being created.
 	ID string
+
+	// ClientWide is set when the per-client limit was reached rather than
+	// the per-user one. It is independent of Yours.
+	ClientWide bool
 }
 
-func (e *QuotaError) Error() string        { return ErrQuota.Error() }
+func (e *QuotaError) Error() string { return ErrQuota.Error() }
+
+// Is makes every *QuotaError match ErrQuota, so callers that only need to
+// know "over quota" can use errors.Is.
 func (e *QuotaError) Is(target error) bool { return target == ErrQuota }
 
 // Owner is who is asking. Hash is the hex SHA-256 of the browser's token, so
@@ -49,6 +62,8 @@ type Owner struct {
 	Client string
 }
 
+// Config configures a Manager. Every field except Grace and Logger is
+// required; New reports all missing or invalid fields at once.
 type Config struct {
 	Provider     vm.Provider
 	Image        string // absolute path, already validated by config
