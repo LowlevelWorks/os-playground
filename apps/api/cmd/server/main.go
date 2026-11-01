@@ -17,6 +17,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/os-playground-api/internal/config"
+	"github.com/os-playground-api/internal/database"
 	"github.com/os-playground-api/internal/httpserver"
 	"github.com/os-playground-api/internal/session"
 	"github.com/os-playground-api/internal/vm/localqemu"
@@ -66,6 +67,18 @@ func run() error {
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	log.Info("config loaded", "config", cfg)
+
+	dbCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// The pool is opened now so a bad URL or an unreachable database fails at
+	// startup. session.Store takes it over in ADR 0010 stage 3.2.
+	pool, err := database.New(dbCtx, cfg.DatabaseURL.Reveal(), int32(cfg.DBMaxConns)) //nolint:gosec // G115: Load bounds DBMaxConns to 1..1000
+	if err != nil {
+		return fmt.Errorf("connect database: %w", err)
+	}
+
+	defer pool.Close()
 
 	provider, err := localqemu.New(localqemu.Config{
 		QEMUBin: cfg.QEMUBin,

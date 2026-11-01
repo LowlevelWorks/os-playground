@@ -10,6 +10,13 @@ ISO         ?= ../../../my-os/build/os.iso
 ISO_ABS     := $(abspath $(ISO))
 BOOT_MARKER ?= x86_64 Kernel
 BIN         := bin/server
+
+# Build, test and lint with the Go version in go.mod, as CI does. Go switches
+# toolchains only upward, so a newer local Go would otherwise be used as is.
+# Set GOTOOLCHAIN in the environment to override (e.g. GOTOOLCHAIN=local).
+GOTOOLCHAIN ?= go$(shell awk '/^go /{print $$2}' go.mod)
+export GOTOOLCHAIN
+
 HOST_GOOS   := $(shell go env GOOS)
 TOOLS       := $(CURDIR)/.tools
 
