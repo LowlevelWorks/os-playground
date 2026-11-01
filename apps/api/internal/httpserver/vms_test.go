@@ -48,6 +48,7 @@ func newQuotaAPI(t *testing.T, capacity, perClient int) *api {
 		Provider:     f,
 		Image:        "/secret/images/os.iso",
 		MemoryMB:     128,
+		MaxPerOwner:  perClient,
 		MaxPerClient: perClient,
 		IdleTimeout:  time.Hour,
 		MaxDuration:  2 * time.Hour,

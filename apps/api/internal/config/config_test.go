@@ -35,9 +35,13 @@ func TestDefaults(t *testing.T) {
 	if cfg.ListenAddr != "127.0.0.1:8080" {
 		t.Errorf("ListenAddr = %q, want loopback only", cfg.ListenAddr)
 	}
-	if cfg.VMMemoryMB != 128 || cfg.MaxSessions != 2 || cfg.MaxVMsPerClient != 1 {
-		t.Errorf("memory/sessions/per client = %d/%d/%d, want 128/2/1",
-			cfg.VMMemoryMB, cfg.MaxSessions, cfg.MaxVMsPerClient)
+	if cfg.VMMemoryMB != 128 || cfg.MaxSessions != 2 {
+		t.Errorf("memory/sessions = %d/%d, want 128/2", cfg.VMMemoryMB, cfg.MaxSessions)
+	}
+	// ADR 0010, section 13.3.
+	if cfg.MaxSessionsPerUser != 1 || cfg.MaxSessionsPerClient != 3 || cfg.FailedVisibleFor != 5*time.Minute {
+		t.Errorf("per user/per client/failed visible = %d/%d/%s, want 1/3/5m",
+			cfg.MaxSessionsPerUser, cfg.MaxSessionsPerClient, cfg.FailedVisibleFor)
 	}
 	if cfg.IdleTimeout != 15*time.Minute || cfg.MaxDuration != time.Hour {
 		t.Errorf("timeouts = %s/%s", cfg.IdleTimeout, cfg.MaxDuration)
@@ -48,15 +52,18 @@ func TestDefaults(t *testing.T) {
 	}
 }
 
-// The per-client limit may exceed the global one: it then never bites, which
-// is a valid choice for a single-user deployment.
-func TestPerClientLimitIsIndependentOfCapacity(t *testing.T) {
-	cfg, err := Load(env(map[string]string{EnvMaxSessions: "2", EnvMaxPerClient: "5"}))
+// The limits are independent: one that exceeds another never bites, which is
+// a valid choice (a single-user deployment, or a per-user limit above the
+// per-client one on a network known to be one person).
+func TestLimitsAreIndependent(t *testing.T) {
+	cfg, err := Load(env(map[string]string{
+		EnvMaxSessions: "2", EnvMaxSessionsPerUser: "4", EnvMaxSessionsPerClient: "5",
+	}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.MaxVMsPerClient != 5 {
-		t.Fatalf("MaxVMsPerClient = %d, want 5", cfg.MaxVMsPerClient)
+	if cfg.MaxSessionsPerUser != 4 || cfg.MaxSessionsPerClient != 5 {
+		t.Fatalf("per user/per client = %d/%d, want 4/5", cfg.MaxSessionsPerUser, cfg.MaxSessionsPerClient)
 	}
 }
 
@@ -103,9 +110,13 @@ func TestBadValuesAreRejected(t *testing.T) {
 		{"memory not a number", map[string]string{EnvVMMemoryMB: "lots"}, EnvVMMemoryMB},
 		{"memory too big", map[string]string{EnvVMMemoryMB: "999999"}, EnvVMMemoryMB},
 		{"zero sessions", map[string]string{EnvMaxSessions: "0"}, EnvMaxSessions},
-		{"zero per client", map[string]string{EnvMaxPerClient: "0"}, EnvMaxPerClient},
-		{"per client too big", map[string]string{EnvMaxPerClient: "1001"}, EnvMaxPerClient},
-		{"per client not a number", map[string]string{EnvMaxPerClient: "two"}, EnvMaxPerClient},
+		{"zero per user", map[string]string{EnvMaxSessionsPerUser: "0"}, EnvMaxSessionsPerUser},
+		{"per user not a number", map[string]string{EnvMaxSessionsPerUser: "one"}, EnvMaxSessionsPerUser},
+		{"zero per client", map[string]string{EnvMaxSessionsPerClient: "0"}, EnvMaxSessionsPerClient},
+		{"per client too big", map[string]string{EnvMaxSessionsPerClient: "1001"}, EnvMaxSessionsPerClient},
+		{"per client not a number", map[string]string{EnvMaxSessionsPerClient: "two"}, EnvMaxSessionsPerClient},
+		{"failed visible zero", map[string]string{EnvFailedVisibleFor: "0s"}, EnvFailedVisibleFor},
+		{"failed visible too long", map[string]string{EnvFailedVisibleFor: "48h"}, EnvFailedVisibleFor},
 		{"bad duration", map[string]string{EnvIdleTimeout: "soon"}, EnvIdleTimeout},
 		{"negative duration", map[string]string{EnvMaxDuration: "-5m"}, EnvMaxDuration},
 		{"max shorter than idle", map[string]string{EnvIdleTimeout: "30m", EnvMaxDuration: "10m"}, EnvMaxDuration},

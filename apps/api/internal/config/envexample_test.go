@@ -139,8 +139,8 @@ func TestEnvExampleLoads(t *testing.T) {
 		t.Errorf("TrustedProxyHops = %d, want 0 in the example: anything else trusts X-Forwarded-For",
 			cfg.TrustedProxyHops)
 	}
-	if cfg.MaxVMsPerClient < 1 {
-		t.Errorf("MaxVMsPerClient = %d, want a limit", cfg.MaxVMsPerClient)
+	if cfg.MaxSessionsPerUser < 1 || cfg.MaxSessionsPerClient < 1 {
+		t.Errorf("per user/per client = %d/%d, want limits", cfg.MaxSessionsPerUser, cfg.MaxSessionsPerClient)
 	}
 }
 
