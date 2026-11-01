@@ -90,12 +90,30 @@ jobs:
       - name: Build image
         run: docker build --tag os-playground-api:ci .
 
+      # The server connects to PostgreSQL at startup, so the smoke test runs
+      # one beside it on a private network, the same version as compose.
+      - name: Start PostgreSQL
+        run: |
+          docker network create smoke
+          docker run --detach --name db --network smoke \
+            --env POSTGRES_USER=playground \
+            --env POSTGRES_PASSWORD=playground \
+            --env POSTGRES_DB=playground \
+            postgres:18
+          for _ in $(seq 1 30); do
+            if docker exec db pg_isready -U playground -d playground; then exit 0; fi
+            sleep 1
+          done
+          docker logs db
+          exit 1
+
       # An empty file stands in for the OS image: the server only checks that
       # it exists at startup, and no VM is started.
       - name: Smoke test
         run: |
           : > "$RUNNER_TEMP/os.iso"
-          docker run --detach --name api --publish 8080:8080 \
+          docker run --detach --name api --network smoke --publish 8080:8080 \
+            --env PLAYGROUND_DATABASE_URL=postgres://playground:playground@db:5432/playground \
             --volume "$RUNNER_TEMP/os.iso:/opt/os/os.iso:ro" os-playground-api:ci
           for _ in $(seq 1 20); do
             if docker exec api /usr/local/bin/server -healthcheck; then
@@ -106,6 +124,7 @@ jobs:
             sleep 1
           done
           docker logs api
+          docker logs db
           exit 1
 
   web:
