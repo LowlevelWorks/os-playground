@@ -1,6 +1,9 @@
 package config
 
 import (
+	"encoding/json"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -9,8 +12,19 @@ import (
 	"time"
 )
 
+// testDatabaseURL is a valid URL every test gets unless it sets its own.
+const testDatabaseURL = "postgres://playground:s3cret@127.0.0.1:5432/playground"
+
+// env serves m, plus testDatabaseURL when m does not mention the key. Set the
+// key to "" to test it missing.
 func env(m map[string]string) Lookup {
-	return func(k string) (string, bool) { v, ok := m[k]; return v, ok }
+	return func(k string) (string, bool) {
+		v, ok := m[k]
+		if !ok && k == EnvDatabaseURL {
+			return testDatabaseURL, true
+		}
+		return v, ok
+	}
 }
 
 func TestDefaults(t *testing.T) {
@@ -100,6 +114,14 @@ func TestBadValuesAreRejected(t *testing.T) {
 		{"too many proxy hops", map[string]string{EnvTrustedProxyHops: "99"}, EnvTrustedProxyHops},
 		{"unknown accelerator", map[string]string{EnvQEMUAccel: "kvn"}, EnvQEMUAccel},
 		{"accelerator with injected option", map[string]string{EnvQEMUAccel: "tcg,thread=multi"}, EnvQEMUAccel},
+		{"database url missing", map[string]string{EnvDatabaseURL: ""}, EnvDatabaseURL},
+		{"database url blank", map[string]string{EnvDatabaseURL: "   "}, EnvDatabaseURL},
+		{"database url wrong scheme", map[string]string{EnvDatabaseURL: "mysql://u:p@h/db"}, EnvDatabaseURL},
+		{"database url without host", map[string]string{EnvDatabaseURL: "postgres://u:p@/db"}, EnvDatabaseURL},
+		{"database url without user", map[string]string{EnvDatabaseURL: "postgres://h/db"}, EnvDatabaseURL},
+		{"database url without name", map[string]string{EnvDatabaseURL: "postgres://u:p@h/"}, EnvDatabaseURL},
+		{"database url bad port", map[string]string{EnvDatabaseURL: "postgres://u:p@h:0/db"}, EnvDatabaseURL},
+		{"database url unparsable", map[string]string{EnvDatabaseURL: "postgres://u:p@h:x y/db"}, EnvDatabaseURL},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -108,6 +130,34 @@ func TestBadValuesAreRejected(t *testing.T) {
 				t.Fatalf("Load error = %v, want one naming %s", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestDatabaseURLIsKept(t *testing.T) {
+	for _, raw := range []string{testDatabaseURL, "postgresql://u@db.internal/app?sslmode=require"} {
+		cfg, err := Load(env(map[string]string{EnvDatabaseURL: raw}))
+		if err != nil {
+			t.Fatalf("Load(%q): %v", raw, err)
+		}
+		if cfg.DatabaseURL.Reveal() != raw {
+			t.Errorf("DatabaseURL = %q, want %q", cfg.DatabaseURL, raw)
+		}
+	}
+}
+
+// The error is logged at startup, so it must never carry the password.
+func TestDatabaseURLErrorHidesPassword(t *testing.T) {
+	for _, raw := range []string{
+		"mysql://u:hunter2@h/db",        // fails validation
+		"postgres://u:hunter2@h:x y/db", // fails to parse
+	} {
+		_, err := Load(env(map[string]string{EnvDatabaseURL: raw}))
+		if err == nil {
+			t.Fatalf("Load(%q) = nil, want an error", raw)
+		}
+		if strings.Contains(err.Error(), "hunter2") {
+			t.Errorf("error leaks the password: %v", err)
+		}
 	}
 }
 
@@ -215,5 +265,86 @@ func TestValidateChecksKVMDeviceOnlyForKVM(t *testing.T) {
 	}
 	if err := validate("tcg"); err != nil {
 		t.Errorf("tcg must not need the device: %v", err)
+	}
+}
+
+// A Secret must not leak through any of the ways a Config gets printed.
+func TestDatabaseURLNeverPrinted(t *testing.T) {
+	const pw = "s3cret"
+	for _, raw := range []string{
+		testDatabaseURL,
+		"postgres://u@h/db?password=" + pw,
+	} {
+		cfg, err := Load(env(map[string]string{EnvDatabaseURL: raw}))
+		if err != nil {
+			t.Fatalf("Load(%q): %v", raw, err)
+		}
+		var logs strings.Builder
+		slog.New(slog.NewTextHandler(&logs, nil)).Info("x", "config", cfg)
+		js, _ := json.Marshal(cfg)
+		for name, out := range map[string]string{
+			"%v":   fmt.Sprintf("%v", cfg),
+			"%+v":  fmt.Sprintf("%+v", cfg),
+			"%#v":  fmt.Sprintf("%#v", cfg),
+			"json": string(js),
+			"slog": logs.String(),
+		} {
+			if strings.Contains(out, pw) {
+				t.Errorf("%s of a Config shows the password: %s", name, out)
+			}
+		}
+		if !strings.Contains(logs.String(), "h") || !strings.Contains(logs.String(), "db") {
+			t.Errorf("slog should still show host and database: %s", logs.String())
+		}
+	}
+}
+
+func TestDatabaseURLForms(t *testing.T) {
+	ok := []string{
+		"postgres://u@/db?host=/var/run/postgresql",
+		"postgres://u:p@h/db?sslmode=verify-full",
+	}
+	for _, raw := range ok {
+		if _, err := Load(env(map[string]string{EnvDatabaseURL: raw})); err != nil {
+			t.Errorf("Load(%q) = %v, want ok", raw, err)
+		}
+	}
+	_, err := Load(env(map[string]string{EnvDatabaseURL: "postgres://u:p@h/db?sslmode=requir&password=hunter2"}))
+	if err == nil || !strings.Contains(err.Error(), "sslmode") {
+		t.Fatalf("bad sslmode: err = %v", err)
+	}
+	if strings.Contains(err.Error(), "hunter2") {
+		t.Errorf("error shows a ?password= value: %v", err)
+	}
+}
+
+// One bad value must produce one error, not a second one comparing the
+// default it fell back to with a related setting.
+func TestBadValueDoesNotReportAMadeUpConflict(t *testing.T) {
+	_, err := Load(env(map[string]string{EnvRateLimitRPS: "abc", EnvRateLimitBurst: "0"}))
+	if err == nil {
+		t.Fatal("Load = nil, want an error")
+	}
+	if strings.Contains(err.Error(), EnvRateLimitBurst) {
+		t.Errorf("reports a conflict caused only by the fallback default: %v", err)
+	}
+}
+
+func TestDatabaseSettings(t *testing.T) {
+	cfg, err := Load(env(nil))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.DBMaxConns != defaultDBMaxConns || cfg.AdmissionLockWait != defaultAdmissionLockWait {
+		t.Errorf("defaults = %d, %v", cfg.DBMaxConns, cfg.AdmissionLockWait)
+	}
+	for _, bad := range []map[string]string{
+		{EnvDBMaxConns: "0"},
+		{EnvAdmissionLockWait: "0s"},
+		{EnvAdmissionLockWait: "1m"},
+	} {
+		if _, err := Load(env(bad)); err == nil {
+			t.Errorf("Load(%v) = nil, want an error", bad)
+		}
 	}
 }

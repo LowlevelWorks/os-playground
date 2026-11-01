@@ -225,7 +225,7 @@ func attachRequest(id string) *http.Request {
 }
 
 func TestAttachErrorsBecomeStatusCodes(t *testing.T) {
-	secret := "open /home/ops/images/secret.iso: permission denied" //nolint:gosec // G101: a host path that must not leak, not a credential
+	secret := "open /home/ops/images/secret.iso: permission denied"
 
 	tests := []struct {
 		name string

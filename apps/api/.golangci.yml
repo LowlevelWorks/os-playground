@@ -60,6 +60,10 @@ linters:
       - path: _test\.go
         linters: [noctx]
         text: httptest\.NewRequest must not be called
+      # Test fixtures use fake database URLs with fake passwords.
+      - path: _test\.go
+        linters: [gosec]
+        text: G101
 
 formatters:
   enable:

@@ -32,6 +32,10 @@ const (
 	EnvRateLimitBurst       = "PLAYGROUND_RATE_LIMIT_BURST"
 	EnvCreateLimitPerMinute = "PLAYGROUND_CREATE_LIMIT_PER_MINUTE"
 	EnvTrustedProxyHops     = "PLAYGROUND_TRUSTED_PROXY_HOPS"
+
+	EnvDatabaseURL       = "PLAYGROUND_DATABASE_URL"
+	EnvDBMaxConns        = "PLAYGROUND_DB_MAX_CONNS"
+	EnvAdmissionLockWait = "PLAYGROUND_ADMISSION_LOCK_WAIT"
 )
 
 const (
@@ -52,7 +56,15 @@ const (
 	defaultRateLimitBurst       = 40
 	defaultCreateLimitPerMinute = 5
 
+	// Admission holds one pooled connection per waiting create, so the pool
+	// must be larger than the create burst the rate limiter lets through.
+	defaultDBMaxConns        = 10
+	defaultAdmissionLockWait = 2 * time.Second
+
 	maxVMMemoryMB  = 4096
+	maxDBMaxConns  = 1000
+	maxLockWait    = 30 * time.Second
+	maxLifetime    = 7 * 24 * time.Hour
 	maxMaxSessions = 1000
 	maxRateLimit   = 100_000
 	maxProxyHops   = 10
@@ -68,6 +80,15 @@ type Config struct {
 	// MetricsAddr serves Prometheus metrics at /metrics. It is a listener of
 	// its own, never the API's: nothing public should reach it.
 	MetricsAddr string
+
+	// DatabaseURL is a Secret: printing, logging or JSON-encoding the Config
+	// never shows it. Call Reveal to pass it to the driver.
+	DatabaseURL Secret
+
+	// DBMaxConns caps the connection pool. AdmissionLockWait is how long a
+	// create waits for the admission lock before answering 503.
+	DBMaxConns        int
+	AdmissionLockWait time.Duration
 
 	ImagePath  string
 	QEMUBin    string
@@ -107,64 +128,94 @@ type Lookup func(key string) (value string, ok bool)
 // Load reads the configuration and reports every problem at once. It does not
 // touch the file system: call Validate for that.
 func Load(lookup Lookup) (Config, error) {
-	l := loader{lookup: lookup}
+	l := loader{lookup: lookup, bad: map[string]bool{}}
 
 	cfg := Config{
 		ListenAddr:  l.str(EnvAddr, defaultAddr),
 		MetricsAddr: l.str(EnvMetricsAddr, defaultMetricsAddr),
-		ImagePath:   l.str(EnvImage, defaultImage),
-		QEMUBin:     l.str(EnvQEMUBin, defaultQEMUBin),
-		QEMUAccel:   l.oneOf(EnvQEMUAccel, "", accelerators),
-		VMMemoryMB:  l.intInRange(EnvVMMemoryMB, defaultVMMemoryMB, 1, maxVMMemoryMB),
-		MaxSessions: l.intInRange(EnvMaxSessions, defaultMaxSessions, 1, maxMaxSessions),
 
+		ImagePath:  l.str(EnvImage, defaultImage),
+		QEMUBin:    l.str(EnvQEMUBin, defaultQEMUBin),
+		QEMUAccel:  l.oneOf(EnvQEMUAccel, "", accelerators),
+		VMMemoryMB: l.intInRange(EnvVMMemoryMB, defaultVMMemoryMB, 1, maxVMMemoryMB),
+
+		MaxSessions:     l.intInRange(EnvMaxSessions, defaultMaxSessions, 1, maxMaxSessions),
 		MaxVMsPerClient: l.intInRange(EnvMaxPerClient, defaultMaxPerClient, 1, maxMaxSessions),
+
+		IdleTimeout: l.duration(EnvIdleTimeout, defaultIdleTimeout, maxLifetime),
+		MaxDuration: l.duration(EnvMaxDuration, defaultMaxDuration, maxLifetime),
 
 		RateLimitRPS:         l.intInRange(EnvRateLimitRPS, defaultRateLimitRPS, 0, maxRateLimit),
 		RateLimitBurst:       l.intInRange(EnvRateLimitBurst, defaultRateLimitBurst, 0, maxRateLimit),
 		CreateLimitPerMinute: l.intInRange(EnvCreateLimitPerMinute, defaultCreateLimitPerMinute, 0, maxRateLimit),
 		TrustedProxyHops:     l.intInRange(EnvTrustedProxyHops, 0, 0, maxProxyHops),
+
+		DBMaxConns:        l.intInRange(EnvDBMaxConns, defaultDBMaxConns, 1, maxDBMaxConns),
+		AdmissionLockWait: l.duration(EnvAdmissionLockWait, defaultAdmissionLockWait, maxLockWait),
 	}
 
-	if (cfg.RateLimitRPS == 0) != (cfg.RateLimitBurst == 0) {
-		l.fail(EnvRateLimitBurst, strconv.Itoa(cfg.RateLimitBurst),
-			"must be 0 exactly when "+EnvRateLimitRPS+" is 0")
-	}
-
-	durationsBefore := len(l.errs)
-	cfg.IdleTimeout = l.duration(EnvIdleTimeout, defaultIdleTimeout)
-	cfg.MaxDuration = l.duration(EnvMaxDuration, defaultMaxDuration)
-
-	if len(l.errs) == durationsBefore && cfg.MaxDuration < cfg.IdleTimeout {
-		l.fail(EnvMaxDuration, cfg.MaxDuration.String(),
-			"must not be shorter than "+EnvIdleTimeout)
-	}
-
-	if err := checkListenAddr(cfg.ListenAddr); err != nil {
-		l.fail(EnvAddr, cfg.ListenAddr, err.Error())
-	}
-
-	if err := checkListenAddr(cfg.MetricsAddr); err != nil {
-		l.fail(EnvMetricsAddr, cfg.MetricsAddr, err.Error())
-	} else if cfg.MetricsAddr == cfg.ListenAddr {
-		l.fail(EnvMetricsAddr, cfg.MetricsAddr, "must differ from "+EnvAddr)
-	}
-
-	if raw := l.str(EnvAllowedOrigins, ""); raw != "" {
-		origins, err := parseOrigins(raw)
-		if err != nil {
-			l.fail(EnvAllowedOrigins, raw, err.Error())
-		} else {
-			cfg.AllowedOrigins = origins
-		}
-	} else {
-		cfg.AllowedOrigins = defaultOrigins()
-	}
+	l.listenAddrs(&cfg)
+	cfg.AllowedOrigins = l.origins()
+	cfg.DatabaseURL = l.databaseURL()
+	l.relations(cfg)
 
 	if len(l.errs) > 0 {
 		return Config{}, errors.Join(l.errs...)
 	}
 	return cfg, nil
+}
+
+func (l *loader) listenAddrs(cfg *Config) {
+	if err := checkListenAddr(cfg.ListenAddr); err != nil {
+		l.fail(EnvAddr, cfg.ListenAddr, err.Error())
+	}
+	if err := checkListenAddr(cfg.MetricsAddr); err != nil {
+		l.fail(EnvMetricsAddr, cfg.MetricsAddr, err.Error())
+	} else if l.ok(EnvAddr) && cfg.MetricsAddr == cfg.ListenAddr {
+		l.fail(EnvMetricsAddr, cfg.MetricsAddr, "must differ from "+EnvAddr)
+	}
+}
+
+func (l *loader) origins() []string {
+	raw := l.str(EnvAllowedOrigins, "")
+	if raw == "" {
+		return defaultOrigins()
+	}
+	origins, err := parseOrigins(raw)
+	if err != nil {
+		l.fail(EnvAllowedOrigins, raw, err.Error())
+		return nil
+	}
+	return origins
+}
+
+func (l *loader) databaseURL() Secret {
+	raw := l.str(EnvDatabaseURL, "")
+	if raw == "" {
+		l.fail(EnvDatabaseURL, "", "is required")
+		return ""
+	}
+	if err := validateDatabaseURL(raw); err != nil {
+		// The URL holds the password and this error is logged: never echo it.
+		l.fail(EnvDatabaseURL, redactURL(raw), err.Error())
+		return ""
+	}
+	return Secret(raw)
+}
+
+// relations checks rules between settings. Each runs only when the settings it
+// compares parsed, so one bad value does not also report a made-up conflict
+// with the default that replaced it.
+func (l *loader) relations(cfg Config) {
+	if l.ok(EnvRateLimitRPS, EnvRateLimitBurst) &&
+		(cfg.RateLimitRPS == 0) != (cfg.RateLimitBurst == 0) {
+		l.fail(EnvRateLimitBurst, strconv.Itoa(cfg.RateLimitBurst),
+			"must be 0 exactly when "+EnvRateLimitRPS+" is 0")
+	}
+	if l.ok(EnvIdleTimeout, EnvMaxDuration) && cfg.MaxDuration < cfg.IdleTimeout {
+		l.fail(EnvMaxDuration, cfg.MaxDuration.String(),
+			"must not be shorter than "+EnvIdleTimeout)
+	}
 }
 
 // Validate checks the things Load cannot: that the image and QEMU exist. It
@@ -215,6 +266,10 @@ func (c Config) OriginHosts() []string {
 func (c Config) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("addr", c.ListenAddr),
+		slog.String("metrics_addr", c.MetricsAddr),
+		slog.Any("database", c.DatabaseURL),
+		slog.Int("db_max_conns", c.DBMaxConns),
+		slog.Duration("admission_lock_wait", c.AdmissionLockWait),
 		slog.String("image", c.ImagePath),
 		slog.String("qemu", c.QEMUBin),
 		slog.String("qemu_accel", c.QEMUAccel),
@@ -260,10 +315,22 @@ func checkReadableFile(path string) error {
 type loader struct {
 	lookup Lookup
 	errs   []error
+	bad    map[string]bool // keys that failed, so relations can skip them
 }
 
 func (l *loader) fail(key, raw, msg string) {
+	l.bad[key] = true
 	l.errs = append(l.errs, fmt.Errorf("%s=%q: %s", key, raw, msg))
+}
+
+// ok reports whether none of keys has failed.
+func (l *loader) ok(keys ...string) bool {
+	for _, k := range keys {
+		if l.bad[k] {
+			return false
+		}
+	}
+	return true
 }
 
 func (l *loader) str(key, def string) string {
@@ -306,7 +373,7 @@ func (l *loader) intInRange(key string, def, lo, hi int) int {
 	return n
 }
 
-func (l *loader) duration(key string, def time.Duration) time.Duration {
+func (l *loader) duration(key string, def, hi time.Duration) time.Duration {
 	raw := l.str(key, "")
 	if raw == "" {
 		return def
@@ -316,8 +383,8 @@ func (l *loader) duration(key string, def time.Duration) time.Duration {
 		l.fail(key, raw, `must be a duration such as "90s", "15m" or "1h"`)
 		return def
 	}
-	if d <= 0 {
-		l.fail(key, raw, "must be greater than 0")
+	if d <= 0 || d > hi {
+		l.fail(key, raw, "must be greater than 0 and at most "+hi.String())
 		return def
 	}
 	return d
@@ -361,4 +428,55 @@ func parseOrigins(raw string) ([]string, error) {
 		out = append(out, strings.ToLower(u.Scheme+"://"+u.Host))
 	}
 	return out, nil
+}
+
+// sslModes are the values libpq and pgx accept; a typo is otherwise only
+// found at the first connection.
+var sslModes = []string{"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
+
+// validateDatabaseURL accepts what pgx accepts in URL form, including a Unix
+// socket given as ?host=/path. Its errors never contain the URL.
+func validateDatabaseURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		// Not %w: url.Error quotes the whole URL, password included.
+		return errors.New("not a valid URL")
+	}
+	if u.Scheme != "postgres" && u.Scheme != "postgresql" {
+		return errors.New("scheme must be postgres or postgresql")
+	}
+	q := u.Query()
+	if u.Hostname() == "" && q.Get("host") == "" {
+		return errors.New("a host is required, in the URL or as ?host=/socket/dir")
+	}
+	if u.User == nil || u.User.Username() == "" {
+		return errors.New("username is required")
+	}
+	if strings.Trim(u.Path, "/") == "" {
+		return errors.New("database name is required")
+	}
+	if port := u.Port(); port != "" {
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+			return errors.New("port must be between 1 and 65535")
+		}
+	}
+	if mode := q.Get("sslmode"); mode != "" && !slices.Contains(sslModes, mode) {
+		return errors.New("sslmode must be one of " + strings.Join(sslModes, ", "))
+	}
+	return nil
+}
+
+// redactURL is raw with any password replaced, whether in the userinfo or as
+// ?password=, or a placeholder when raw does not parse and so cannot be
+// redacted safely.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<unparsable>"
+	}
+	if q := u.Query(); q.Has("password") {
+		q.Set("password", "xxxxx")
+		u.RawQuery = q.Encode()
+	}
+	return u.Redacted()
 }
