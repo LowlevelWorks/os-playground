@@ -23,10 +23,13 @@ const (
 	EnvQEMUAccel      = "PLAYGROUND_QEMU_ACCEL"
 	EnvVMMemoryMB     = "PLAYGROUND_VM_MEMORY_MB"
 	EnvMaxSessions    = "PLAYGROUND_MAX_SESSIONS"
-	EnvMaxPerClient   = "PLAYGROUND_MAX_VMS_PER_CLIENT"
 	EnvAllowedOrigins = "PLAYGROUND_ALLOWED_ORIGINS"
 	EnvIdleTimeout    = "PLAYGROUND_IDLE_TIMEOUT"
 	EnvMaxDuration    = "PLAYGROUND_MAX_DURATION"
+
+	EnvMaxSessionsPerUser   = "PLAYGROUND_MAX_SESSIONS_PER_USER"
+	EnvMaxSessionsPerClient = "PLAYGROUND_MAX_SESSIONS_PER_CLIENT"
+	EnvFailedVisibleFor     = "PLAYGROUND_FAILED_VISIBLE_FOR"
 
 	EnvRateLimitRPS         = "PLAYGROUND_RATE_LIMIT_RPS"
 	EnvRateLimitBurst       = "PLAYGROUND_RATE_LIMIT_BURST"
@@ -41,15 +44,19 @@ const (
 const (
 	// Loopback only, so the server is reachable from other machines only when
 	// someone asks for that explicitly with PLAYGROUND_ADDR.
-	defaultAddr         = "127.0.0.1:8080"
-	defaultMetricsAddr  = "127.0.0.1:9090"
-	defaultImage        = "build/os.iso"
-	defaultQEMUBin      = "qemu-system-x86_64"
-	defaultVMMemoryMB   = 128
-	defaultMaxSessions  = 2
-	defaultMaxPerClient = 1
-	defaultIdleTimeout  = 15 * time.Minute
-	defaultMaxDuration  = time.Hour
+	defaultAddr        = "127.0.0.1:8080"
+	defaultMetricsAddr = "127.0.0.1:9090"
+	defaultImage       = "build/os.iso"
+	defaultQEMUBin     = "qemu-system-x86_64"
+	defaultVMMemoryMB  = 128
+	defaultMaxSessions = 2
+	// ADR 0010, section 13.3: one live session per user, and a looser
+	// per-address backstop so shared networks (offices, schools) still work.
+	defaultMaxSessionsPerUser   = 1
+	defaultMaxSessionsPerClient = 3
+	defaultFailedVisibleFor     = 5 * time.Minute
+	defaultIdleTimeout          = 15 * time.Minute
+	defaultMaxDuration          = time.Hour
 
 	// Per client. The frontend polls at 2 requests a second while a VM boots.
 	defaultRateLimitRPS         = 10
@@ -61,13 +68,15 @@ const (
 	defaultDBMaxConns        = 10
 	defaultAdmissionLockWait = 2 * time.Second
 
-	maxVMMemoryMB  = 4096
-	maxDBMaxConns  = 1000
-	maxLockWait    = 30 * time.Second
-	maxLifetime    = 7 * 24 * time.Hour
-	maxMaxSessions = 1000
-	maxRateLimit   = 100_000
-	maxProxyHops   = 10
+	maxVMMemoryMB = 4096
+	maxDBMaxConns = 1000
+	maxLockWait   = 30 * time.Second
+	maxLifetime   = 7 * 24 * time.Hour
+	// A failed session holds no VM, but it does keep a row and a page alive.
+	maxFailedVisible = 24 * time.Hour
+	maxMaxSessions   = 1000
+	maxRateLimit     = 100_000
+	maxProxyHops     = 10
 )
 
 // accelerators are the values localqemu accepts. It checks them again; they
@@ -98,10 +107,18 @@ type Config struct {
 	// which picks tcg. kvm needs Linux with /dev/kvm, which Validate checks.
 	QEMUAccel string
 
-	// MaxSessions is how many VMs may exist at once. MaxVMsPerClient is how
-	// many of them one client (see TrustedProxyHops) may hold.
-	MaxSessions     int
-	MaxVMsPerClient int
+	// MaxSessions is how many VMs may exist at once. MaxSessionsPerUser is how
+	// many live sessions one owner may hold (until login, an owner is the
+	// browser's anonymous token). MaxSessionsPerClient is the backstop for one
+	// network address (see TrustedProxyHops), across all of its owners.
+	MaxSessions          int
+	MaxSessionsPerUser   int
+	MaxSessionsPerClient int
+
+	// FailedVisibleFor is how long a failed or stopped session stays readable
+	// after it ends, so the page can show why (ADR 0010, section 4). Its VM
+	// and its quota are released at once. Used by the reconciler (stage 3.4).
+	FailedVisibleFor time.Duration
 
 	// AllowedOrigins are the web pages allowed to open a terminal, as full
 	// origins: scheme://host[:port]. Use OriginHosts for the WebSocket handler.
@@ -139,8 +156,10 @@ func Load(lookup Lookup) (Config, error) {
 		QEMUAccel:  l.oneOf(EnvQEMUAccel, "", accelerators),
 		VMMemoryMB: l.intInRange(EnvVMMemoryMB, defaultVMMemoryMB, 1, maxVMMemoryMB),
 
-		MaxSessions:     l.intInRange(EnvMaxSessions, defaultMaxSessions, 1, maxMaxSessions),
-		MaxVMsPerClient: l.intInRange(EnvMaxPerClient, defaultMaxPerClient, 1, maxMaxSessions),
+		MaxSessions:          l.intInRange(EnvMaxSessions, defaultMaxSessions, 1, maxMaxSessions),
+		MaxSessionsPerUser:   l.intInRange(EnvMaxSessionsPerUser, defaultMaxSessionsPerUser, 1, maxMaxSessions),
+		MaxSessionsPerClient: l.intInRange(EnvMaxSessionsPerClient, defaultMaxSessionsPerClient, 1, maxMaxSessions),
+		FailedVisibleFor:     l.duration(EnvFailedVisibleFor, defaultFailedVisibleFor, maxFailedVisible),
 
 		IdleTimeout: l.duration(EnvIdleTimeout, defaultIdleTimeout, maxLifetime),
 		MaxDuration: l.duration(EnvMaxDuration, defaultMaxDuration, maxLifetime),
@@ -275,7 +294,9 @@ func (c Config) LogValue() slog.Value {
 		slog.String("qemu_accel", c.QEMUAccel),
 		slog.Int("vm_memory_mb", c.VMMemoryMB),
 		slog.Int("max_sessions", c.MaxSessions),
-		slog.Int("max_vms_per_client", c.MaxVMsPerClient),
+		slog.Int("max_sessions_per_user", c.MaxSessionsPerUser),
+		slog.Int("max_sessions_per_client", c.MaxSessionsPerClient),
+		slog.Duration("failed_visible_for", c.FailedVisibleFor),
 		slog.Any("allowed_origins", c.AllowedOrigins),
 		slog.Duration("idle_timeout", c.IdleTimeout),
 		slog.Duration("max_duration", c.MaxDuration),

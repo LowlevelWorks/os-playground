@@ -358,3 +358,69 @@ func TestFinishedVMFreesTheSlotOnceReaped(t *testing.T) {
 		t.Fatalf("Create after the grace period = %v, want success", err)
 	}
 }
+
+// newLimitsRig is newRig with both limits set.
+func newLimitsRig(t *testing.T, perOwner, perClient int) *rig {
+	t.Helper()
+	r := newRig(t)
+	r.m.perOwner = perOwner
+	r.m.perClient = perClient
+	return r
+}
+
+// One browser holds one live VM, whichever network it comes from.
+func TestOwnerLimitHoldsAcrossNetworks(t *testing.T) {
+	r := newLimitsRig(t, 1, 1000)
+	id := r.mustCreateAs(alice)
+
+	moved := Owner{Hash: alice.Hash, Client: "192.0.2.50"}
+	_, err := r.createAs(moved)
+	if q := quotaError(t, err); !q.Yours || q.ID != id {
+		t.Errorf("same token from another network: %+v, want Yours with ID %s", q, id)
+	}
+	r.mustCreateAs(bob) // same network as alice, another owner
+}
+
+// ADR 0010, section 13.3: one per user, three per address, so a shared
+// network still works but cannot flood with many browsers.
+func TestClientBackstopIsLooserThanOwnerLimit(t *testing.T) {
+	r := newLimitsRig(t, 1, 3)
+	dave := Owner{Hash: "dddd", Client: alice.Client}
+	erin := Owner{Hash: "eeee", Client: alice.Client}
+
+	for _, o := range []Owner{alice, bob, dave} {
+		r.mustCreateAs(o)
+	}
+	_, err := r.createAs(erin)
+	if q := quotaError(t, err); q.Yours || q.ID != "" {
+		t.Errorf("fourth owner on a full network: %+v, want not Yours", q)
+	}
+	r.mustCreateAs(carol) // another network is unaffected
+}
+
+func TestOwnersCreateInFlightCountsOnAnyNetwork(t *testing.T) {
+	f := fake.New(fake.WithAutoRun())
+	h := newHeldCreate(f)
+	r := newRigOver(t, f, h)
+	r.m.perOwner = 1
+	done := startHeld(r, h, alice)
+
+	moved := Owner{Hash: alice.Hash, Client: "192.0.2.50"}
+	_, err := r.createAs(moved)
+	if q := quotaError(t, err); !q.Yours || q.ID != "" {
+		t.Errorf("same token elsewhere while its create is in flight: %+v, want Yours and no ID", q)
+	}
+
+	h.finish <- nil
+	if err := wait(t, done); err != nil {
+		t.Fatalf("the held create: %v", err)
+	}
+}
+
+// An empty hash owns nothing, so it never matches another empty hash's
+// creates in flight or VMs.
+func TestEmptyHashIsNoOwner(t *testing.T) {
+	r := newLimitsRig(t, 1, 1000)
+	r.mustCreateAs(Owner{Client: "192.0.2.1"})
+	r.mustCreateAs(Owner{Client: "192.0.2.2"})
+}

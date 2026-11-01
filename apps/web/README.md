@@ -14,10 +14,11 @@ no accounts: clearing site data, a private window or another browser is a new
 owner. Its old machine is removed by the server once it has been idle
 (`PLAYGROUND_IDLE_TIMEOUT`, 15 minutes by default).
 
-Each network address may hold `PLAYGROUND_MAX_VMS_PER_CLIENT` machines (1 by
-default). Over that, starting a machine offers "Resume it" when the machine in
-the way is this browser's, and otherwise says someone on the same network is
-using it. The machine's ID is kept in `localStorage` too, so a new tab can
+Each browser may hold `PLAYGROUND_MAX_SESSIONS_PER_USER` machines (1 by
+default), and each network address `PLAYGROUND_MAX_SESSIONS_PER_CLIENT` across
+all its browsers (3 by default). Over either, starting a machine offers
+"Resume it" when this browser holds a machine, and otherwise says someone on
+the same network is using it. The machine's ID is kept in `localStorage` too, so a new tab can
 resume it.
 
 If storage is blocked the token lives in memory only; the page says so,

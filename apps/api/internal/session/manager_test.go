@@ -75,6 +75,7 @@ func newRigOver(t *testing.T, f *fake.Fake, p vm.Provider) *rig {
 		MaxDuration: maxLife,
 		Grace:       grace,
 		// Most tests are about lifecycles, not the quota; newQuotaRig sets it.
+		MaxPerOwner:  1000,
 		MaxPerClient: 1000,
 	})
 	if err != nil {
@@ -140,7 +141,7 @@ func TestNewRejectsAConfigurationThatWouldDeleteEverything(t *testing.T) {
 	if err == nil {
 		t.Fatal("New(Config{}) = nil, want errors")
 	}
-	for _, want := range []string{"Provider", "Image", "MemoryMB", "MaxPerClient", "IdleTimeout", "MaxDuration"} {
+	for _, want := range []string{"Provider", "Image", "MemoryMB", "MaxPerOwner", "MaxPerClient", "IdleTimeout", "MaxDuration"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error does not mention %s: %v", want, err)
 		}
@@ -149,7 +150,7 @@ func TestNewRejectsAConfigurationThatWouldDeleteEverything(t *testing.T) {
 
 func TestCreateChoosesTheSpecItself(t *testing.T) {
 	f := fake.New(fake.WithAutoRun())
-	m, err := New(Config{Provider: f, Image: testImage, MemoryMB: 128, IdleTimeout: idle, MaxDuration: maxLife, MaxPerClient: 2})
+	m, err := New(Config{Provider: f, Image: testImage, MemoryMB: 128, IdleTimeout: idle, MaxDuration: maxLife, MaxPerOwner: 2, MaxPerClient: 2})
 	if err != nil {
 		t.Fatal(err)
 	}

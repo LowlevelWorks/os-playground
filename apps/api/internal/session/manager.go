@@ -6,6 +6,10 @@
 //
 // The provider has no List and frees a VM's capacity slot only on Delete, so
 // without this bookkeeping a crashed VM would hold its slot forever.
+//
+// Store is the durable record that replaces the Manager's in-memory one (ADR
+// 0010): PostgreSQL in production, MemStore in tests. Both must pass
+// storetest.Run.
 package session
 
 import (
@@ -26,9 +30,11 @@ import (
 const defaultGrace = 30 * time.Second
 
 // ErrQuota matches every *QuotaError.
-var ErrQuota = errors.New("session: per-client VM limit reached")
+var ErrQuota = errors.New("session: quota reached")
 
-// QuotaError is Create refusing a client that already holds its share.
+// QuotaError refuses a new session because the caller's owner or client
+// already holds its share. ClientWide tells which limit was reached; Yours
+// tells whether the caller can resume a session of its own instead.
 type QuotaError struct {
 	// Yours is true when one of those VMs, or a create still in flight,
 	// belongs to the caller's own token.
@@ -36,9 +42,16 @@ type QuotaError struct {
 	// ID is the caller's oldest live VM. It is empty unless Yours, and empty
 	// while the caller's only VM is still being created.
 	ID string
+
+	// ClientWide is set when the per-client limit was reached rather than
+	// the per-user one. It is independent of Yours.
+	ClientWide bool
 }
 
-func (e *QuotaError) Error() string        { return ErrQuota.Error() }
+func (e *QuotaError) Error() string { return ErrQuota.Error() }
+
+// Is makes every *QuotaError match ErrQuota, so callers that only need to
+// know "over quota" can use errors.Is.
 func (e *QuotaError) Is(target error) bool { return target == ErrQuota }
 
 // Owner is who is asking. Hash is the hex SHA-256 of the browser's token, so
@@ -49,10 +62,13 @@ type Owner struct {
 	Client string
 }
 
+// Config configures a Manager. Every field except Grace and Logger is
+// required; New reports all missing or invalid fields at once.
 type Config struct {
 	Provider     vm.Provider
 	Image        string // absolute path, already validated by config
 	MemoryMB     int
+	MaxPerOwner  int           // live VMs one Owner.Hash may hold, on any Client, counting creates in flight
 	MaxPerClient int           // live VMs one Client may hold, counting creates in flight
 	IdleTimeout  time.Duration // no browser attached for this long -> delete
 	MaxDuration  time.Duration // hard lifetime -> delete
@@ -66,6 +82,7 @@ type Manager struct {
 	provider         vm.Provider
 	image            string
 	memoryMB         int
+	perOwner         int
 	perClient        int
 	idle, max, grace time.Duration
 	log              *slog.Logger
@@ -101,6 +118,9 @@ func New(cfg Config) (*Manager, error) {
 	if cfg.MemoryMB <= 0 {
 		errs = append(errs, fmt.Errorf("session: MemoryMB=%d: must be greater than 0", cfg.MemoryMB))
 	}
+	if cfg.MaxPerOwner <= 0 {
+		errs = append(errs, fmt.Errorf("session: MaxPerOwner=%d: must be greater than 0", cfg.MaxPerOwner))
+	}
 	if cfg.MaxPerClient <= 0 {
 		errs = append(errs, fmt.Errorf("session: MaxPerClient=%d: must be greater than 0", cfg.MaxPerClient))
 	}
@@ -127,6 +147,7 @@ func New(cfg Config) (*Manager, error) {
 		provider:  cfg.Provider,
 		image:     cfg.Image,
 		memoryMB:  cfg.MemoryMB,
+		perOwner:  cfg.MaxPerOwner,
 		perClient: cfg.MaxPerClient,
 		idle:      cfg.IdleTimeout,
 		max:       cfg.MaxDuration,
@@ -183,39 +204,49 @@ func (m *Manager) Create(ctx context.Context, o Owner) (vm.Instance, error) {
 	return inst, nil
 }
 
-// checkQuota counts o.Client's live VMs and creates in flight. VMs being
-// deleted do not count: they are on their way out. The caller holds m.mu.
+// checkQuota counts live VMs and creates in flight against two limits: the
+// caller's own, on any network, and its Client's, across every owner on it.
+// VMs being deleted do not count: they are on their way out. When either
+// limit is hit and the caller holds a VM or a create of its own, the error
+// says so, with the oldest one's ID, so a double click finds the first VM.
+// The caller holds m.mu.
 func (m *Manager) checkQuota(o Owner) error {
-	held := 0
+	ownerHeld, clientHeld := 0, 0
 	var oldestID string
 	var oldest time.Time
 	for id, s := range m.sessions {
-		if s.deleting || s.client != o.Client {
+		if s.deleting {
 			continue
 		}
-		held++
+		if s.client == o.Client {
+			clientHeld++
+		}
 		if !owns(s, o) {
 			continue
 		}
+		ownerHeld++
 		if oldestID == "" || s.created.Before(oldest) || (s.created.Equal(oldest) && id < oldestID) {
 			oldestID, oldest = id, s.created
 		}
 	}
-	for _, n := range m.pending[o.Client] {
-		held += n
-	}
-	if held < m.perClient {
-		return nil
+	for client, byOwner := range m.pending {
+		for hash, n := range byOwner {
+			if client == o.Client {
+				clientHeld += n
+			}
+			if o.Hash != "" && hash == o.Hash {
+				ownerHeld += n
+			}
+		}
 	}
 
-	switch {
-	case oldestID != "":
-		return &QuotaError{Yours: true, ID: oldestID}
-	case m.pending[o.Client][o.Hash] > 0:
-		return &QuotaError{Yours: true}
-	default:
-		return &QuotaError{}
+	if ownerHeld < m.perOwner && clientHeld < m.perClient {
+		return nil
 	}
+	if ownerHeld > 0 {
+		return &QuotaError{Yours: true, ID: oldestID}
+	}
+	return &QuotaError{}
 }
 
 // reserve and unreserve count o's creates in flight. Empty maps are removed so

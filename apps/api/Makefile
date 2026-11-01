@@ -23,11 +23,14 @@ TOOLS       := $(CURDIR)/.tools
 # Keep GOLANGCI_LINT_VERSION in sync with `version:` of golangci-lint-action in ci.yml.
 GOLANGCI_LINT_VERSION ?= v2.15.0
 GOVULNCHECK_VERSION   ?= v1.9.0
+GOOSE_VERSION         ?= v3.29.0
 # The version is in the file name, so bumping it forces a reinstall.
 GOLANGCI_LINT := $(TOOLS)/golangci-lint-$(GOLANGCI_LINT_VERSION)
 GOVULNCHECK   := $(TOOLS)/govulncheck-$(GOVULNCHECK_VERSION)
+GOOSE         := $(TOOLS)/goose-$(GOOSE_VERSION)
 
-.PHONY: help check-iso dev dev-api test test-integration lint lint-fix fmt tidy-check vuln build ci clean
+.PHONY: help check-iso dev dev-api test test-integration lint lint-fix fmt tidy-check vuln build ci clean \
+        migrate migrate-status migrate-down migrate-reset migrate-new
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-18s %s\n", $$1, $$2}'
@@ -76,6 +79,39 @@ build: ## Build the server binary into bin/
 
 ci: tidy-check lint test build vuln ## Run everything CI runs
 
+# Migrations (ADR 0010, section 13.1): run by this target or a deploy step,
+# never by the API on startup. The URL comes from PLAYGROUND_DATABASE_URL, or
+# else from .env like the server reads it. It reaches goose through the
+# environment, so it is never echoed or visible in the process list.
+define goose
+	@url="$${PLAYGROUND_DATABASE_URL:-}"; \
+	if [ -z "$$url" ] && [ -f .env ]; then \
+		url=$$(sed -n 's/^PLAYGROUND_DATABASE_URL=//p' .env | tail -n 1); \
+		url=$${url#\"}; url=$${url%\"}; \
+	fi; \
+	if [ -z "$$url" ]; then echo "PLAYGROUND_DATABASE_URL is not set (environment or .env)" >&2; exit 1; fi; \
+	if [ "$(2)" = local ] && ! printf '%s' "$$url" | grep -Eq '@(localhost|127\.0\.0\.1|\[::1\])[:/]'; then \
+		echo "refusing: $(1) is for a local database only; production migrations move forward" >&2; exit 1; \
+	fi; \
+	GOOSE_DRIVER=postgres GOOSE_DBSTRING="$$url" GOOSE_MIGRATION_DIR=migrations $(GOOSE) $(1)
+endef
+
+migrate: $(GOOSE) ## Apply all pending migrations
+	$(call goose,up)
+
+migrate-status: $(GOOSE) ## Show which migrations are applied
+	$(call goose,status)
+
+migrate-down: $(GOOSE) ## Roll back the last migration (local database only)
+	$(call goose,down,local)
+
+migrate-reset: $(GOOSE) ## Roll back every migration (local database only)
+	$(call goose,reset,local)
+
+migrate-new: $(GOOSE) ## Create a migration: make migrate-new NAME=add_something
+	@test -n "$(NAME)" || { echo "usage: make migrate-new NAME=add_something" >&2; exit 1; }
+	$(GOOSE) -dir migrations create $(NAME) sql
+
 clean: ## Remove build output (keeps .tools)
 	rm -rf bin
 
@@ -86,3 +122,7 @@ $(GOLANGCI_LINT):
 $(GOVULNCHECK):
 	GOBIN=$(TOOLS) go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
 	mv $(TOOLS)/govulncheck $@
+
+$(GOOSE):
+	GOBIN=$(TOOLS) go install github.com/pressly/goose/v3/cmd/goose@$(GOOSE_VERSION)
+	mv $(TOOLS)/goose $@
