@@ -131,7 +131,7 @@ func run() error {
 		return err
 	}
 
-	api := httpserver.NewServer(manager, cfg.AllowedOrigins, httpserver.RateLimits{
+	api := httpserver.NewServer(manager, pool.Ping, cfg.AllowedOrigins, httpserver.RateLimits{
 		RequestsPerSecond: cfg.RateLimitRPS,
 		Burst:             cfg.RateLimitBurst,
 		CreatesPerMinute:  cfg.CreateLimitPerMinute,

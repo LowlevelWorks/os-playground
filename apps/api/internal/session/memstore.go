@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/subtle"
+	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -16,10 +17,11 @@ import (
 // tests run against without a database. One mutex held across all of Admit
 // stands in for PostgreSQL's admission advisory lock.
 type MemStore struct {
-	mu   sync.Mutex
-	now  func() time.Time
-	seq  uint64
-	rows map[string]*row
+	mu    sync.Mutex
+	now   func() time.Time
+	seq   uint64
+	rows  map[string]*row
+	audit []AuditEvent
 }
 
 var _ Store = (*MemStore)(nil)
@@ -38,6 +40,8 @@ type row struct {
 	lastActivity time.Time
 	claimedBy    string
 	claimUntil   time.Time
+	attachHolder string
+	attachUntil  time.Time
 	nextAttempt  time.Time
 	attempts     int
 
@@ -142,6 +146,7 @@ func (m *MemStore) Admit(ctx context.Context, n NewSession, l Limits) (Session, 
 		seq:         m.seq,
 	}
 	m.rows[r.s.ID] = r
+	m.record(now, createdEvent(ctx, r.s))
 	return r.copy(), nil
 }
 
@@ -186,8 +191,13 @@ func (m *MemStore) RequestDelete(ctx context.Context, id, ownerID string) error 
 		return ErrNotFound
 	}
 
+	if r.s.DesiredDeleted {
+		return nil // idempotent: one event, no change
+	}
+	now := m.now().UTC().Truncate(time.Microsecond)
 	r.s.DesiredDeleted = true
-	r.nextAttempt = m.now().UTC()
+	r.nextAttempt = now
+	m.record(now, deleteRequestedEvent(ctx, r.s.ID, r.s.OwnerID))
 	return nil
 }
 
@@ -254,6 +264,9 @@ func (m *MemStore) Complete(ctx context.Context, c Claim, res Result) error {
 	}
 
 	now := m.now().UTC().Truncate(time.Microsecond)
+	for _, e := range completeEvents(r.s.ID, r.s.OwnerID, r.s.Status, r.s.DesiredDeleted, res) {
+		m.record(now, e)
+	}
 	if res.Status != "" {
 		r.s.Status = res.Status
 		if res.Status == StatusRunning && r.startedAt.IsZero() {
@@ -311,6 +324,122 @@ func (m *MemStore) TouchActivity(ctx context.Context, id string, idleFor time.Du
 		r.s.IdleExpiresAt = until
 	}
 	return nil
+}
+
+// HoldingVM implements Store.HoldingVM.
+func (m *MemStore) HoldingVM(ctx context.Context, ids []string) (map[string]bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	out := make(map[string]bool)
+	for _, id := range ids {
+		cid, ok := canonicalID(id)
+		if !ok || cid != id {
+			continue // a provider VM's name is the canonical ID, or not ours
+		}
+		if r, ok := m.rows[cid]; ok && r.holdsVM() {
+			out[id] = true
+		}
+	}
+	return out, nil
+}
+
+// AcquireAttach implements Store.AcquireAttach.
+func (m *MemStore) AcquireAttach(ctx context.Context, id, ownerID, holder string, lease time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if holder == "" || lease <= 0 {
+		return ErrInvalid
+	}
+	cid, ok := canonicalID(id)
+	if !ok {
+		return ErrNotFound
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	r, ok := m.owned(cid, ownerID)
+	switch {
+	case !ok:
+		return ErrNotFound
+	case r.s.DesiredDeleted || r.s.Status != StatusRunning:
+		return ErrNotAttachable
+	}
+	now := m.now().UTC()
+	if r.attachHolder != "" && r.attachHolder != holder && !r.attachUntil.Before(now) {
+		return ErrAttached
+	}
+	r.attachHolder, r.attachUntil = holder, now.Add(lease).Truncate(time.Microsecond)
+	return nil
+}
+
+// RenewAttach implements Store.RenewAttach.
+func (m *MemStore) RenewAttach(ctx context.Context, id, holder string, lease time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if holder == "" || lease <= 0 {
+		return ErrInvalid
+	}
+	cid, _ := canonicalID(id)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	r, ok := m.rows[cid]
+	if !ok || r.attachHolder != holder || r.s.DesiredDeleted {
+		return ErrLeaseLost
+	}
+	r.attachUntil = m.now().UTC().Add(lease).Truncate(time.Microsecond)
+	return nil
+}
+
+// ReleaseAttach implements Store.ReleaseAttach.
+func (m *MemStore) ReleaseAttach(ctx context.Context, id, holder string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	cid, _ := canonicalID(id)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if r, ok := m.rows[cid]; ok && holder != "" && r.attachHolder == holder {
+		r.attachHolder, r.attachUntil = "", time.Time{}
+	}
+	return nil
+}
+
+// AuditEvents returns the events recorded for a session, oldest first. It
+// is for tests and is not part of Store.
+func (m *MemStore) AuditEvents(ctx context.Context, sessionID string) ([]AuditEvent, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []AuditEvent
+	for _, e := range m.audit {
+		if e.SessionID == sessionID {
+			e.Metadata = maps.Clone(e.Metadata)
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+// record appends an audit event. m.mu must be held.
+func (m *MemStore) record(at time.Time, e AuditEvent) {
+	e.OccurredAt = at
+	if e.Metadata == nil {
+		e.Metadata = map[string]string{}
+	}
+	m.audit = append(m.audit, e)
 }
 
 // owned returns the row if ownerID owns it. A missing row and someone else's

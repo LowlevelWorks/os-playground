@@ -88,6 +88,19 @@ var cases = []struct {
 	{"ReconcilerCanDesireDeletion", reconcilerCanDesireDeletion},
 	{"TouchActivityPushesTheIdleDeadline", touchActivityPushesTheIdleDeadline},
 	{"ConcurrentClaimsNeverShare", concurrentClaimsNeverShare},
+
+	{"AdmitIsAudited", admitIsAudited},
+	{"RequestDeleteIsAuditedOnce", requestDeleteIsAuditedOnce},
+	{"StatusChangesAreAudited", statusChangesAreAudited},
+	{"ExpiryIsAudited", expiryIsAudited},
+	{"LostLeaseIsNotAudited", lostLeaseIsNotAudited},
+
+	{"AttachNeedsARunningSession", attachNeedsARunningSession},
+	{"AttachLeaseIsExclusive", attachLeaseIsExclusive},
+	{"ExpiredAttachLeaseIsTakenOver", expiredAttachLeaseIsTakenOver},
+	{"RenewNeedsTheLease", renewNeedsTheLease},
+	{"ConcurrentAcquiresHaveOneWinner", concurrentAcquiresHaveOneWinner},
+	{"HoldingVMListsUnreleasedSessions", holdingVMListsUnreleasedSessions},
 }
 
 func newSession(owner, client string) session.NewSession {

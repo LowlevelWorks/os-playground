@@ -128,6 +128,21 @@ func (f *Fake) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+// List implements vm.Provider.
+func (f *Fake) List(ctx context.Context) ([]vm.Instance, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	out := make([]vm.Instance, 0, len(f.vms))
+	for _, e := range f.vms {
+		out = append(out, e.inst)
+	}
+	return out, nil
+}
+
 // Console implements vm.Provider. Only one console can be attached at a time.
 func (f *Fake) Console(ctx context.Context, id string) (io.ReadWriteCloser, error) {
 	if err := ctx.Err(); err != nil {

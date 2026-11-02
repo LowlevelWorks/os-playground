@@ -42,6 +42,12 @@ var (
 	// overloaded, not full. Map it to 503 with Retry-After.
 	ErrBusy = errors.New("session: busy, try again")
 
+	// ErrNotAttachable and ErrAttached are the vm errors the terminal
+	// handler already maps to 409: the session is not RUNNING (or is being
+	// deleted), or another console holds the attach lease.
+	ErrNotAttachable = vm.ErrNotRunning
+	ErrAttached      = vm.ErrAlreadyAttached
+
 	// ErrLeaseLost means another worker owns the session now: the outcome
 	// passed to Complete was discarded, and the caller must drop it too.
 	ErrLeaseLost = errors.New("session: work lease lost")
@@ -139,8 +145,11 @@ type Result struct {
 	Status Status
 	// FailureReason is stored when not empty.
 	FailureReason string
-	// DesireDeleted is the reconciler's own decision to delete, on expiry.
+	// DesireDeleted is the reconciler's own decision to delete.
 	DesireDeleted bool
+	// ExpireReason, with DesireDeleted, says the session expired and why
+	// ("idle", "max duration"). It is recorded as a PLAYGROUND_EXPIRED event.
+	ExpireReason string
 	// VMReleased records that the VM is confirmed gone, which frees its
 	// capacity slot. Status DELETED needs it, now or from an earlier step.
 	VMReleased bool
@@ -159,6 +168,8 @@ func (r Result) validate(c Claim) error {
 	case r.Status == StatusDeleted && !r.VMReleased && !c.VMReleased:
 		return ErrInvalid
 	case r.RetryAfter < 0:
+		return ErrInvalid
+	case r.ExpireReason != "" && !r.DesireDeleted:
 		return ErrInvalid
 	}
 	return nil
@@ -248,4 +259,23 @@ type Store interface {
 	// TouchActivity records console input: it pushes the idle deadline to at
 	// least now + idleFor. Callers throttle it. A missing ID is ErrNotFound.
 	TouchActivity(ctx context.Context, id string, idleFor time.Duration) error
+
+	// HoldingVM returns which of ids belong to sessions whose VM is not
+	// released. The orphan sweep deletes any provider VM not among them;
+	// IDs that are not session IDs at all are simply absent.
+	HoldingVM(ctx context.Context, ids []string) (map[string]bool, error)
+
+	// AcquireAttach takes the console lease for holder until now + lease.
+	// The session must be ownerID's, RUNNING and not marked for deletion,
+	// else ErrNotFound or ErrNotAttachable; a current lease held by another
+	// holder is ErrAttached. An expired lease is taken over.
+	AcquireAttach(ctx context.Context, id, ownerID, holder string, lease time.Duration) error
+
+	// RenewAttach extends holder's lease to now + lease. ErrLeaseLost means
+	// holder no longer has it, or the session is being deleted.
+	RenewAttach(ctx context.Context, id, holder string, lease time.Duration) error
+
+	// ReleaseAttach gives holder's lease up. It is idempotent: releasing a
+	// lease holder does not have is nil.
+	ReleaseAttach(ctx context.Context, id, holder string) error
 }
