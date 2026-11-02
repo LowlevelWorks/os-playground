@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/os-playground-api/internal/session"
+	"github.com/os-playground-api/internal/session/storetest"
 	"github.com/os-playground-api/internal/vm"
 	"github.com/os-playground-api/internal/vm/fake"
 )
@@ -21,10 +22,11 @@ import (
 // api is the whole HTTP server over a real session manager, an in-memory
 // store and the fake provider.
 type api struct {
-	t    *testing.T
-	fake *fake.Fake
-	srv  *Server
-	logs *syncBuffer
+	t     *testing.T
+	fake  *fake.Fake
+	store *session.MemStore
+	srv   *Server
+	logs  *syncBuffer
 }
 
 // Owner tokens for tests: the right length and alphabet, and easy to spot in
@@ -44,8 +46,9 @@ func newAPI(t *testing.T, capacity int) *api {
 func newQuotaAPI(t *testing.T, capacity, perClient int) *api {
 	t.Helper()
 	f := fake.New(fake.WithAutoRun())
+	store := session.NewMemStore(time.Now)
 	m, err := session.New(session.Config{
-		Store:        session.NewMemStore(time.Now),
+		Store:        store,
 		Provider:     f,
 		Image:        "/secret/images/os.iso",
 		MemoryMB:     128,
@@ -59,17 +62,18 @@ func newQuotaAPI(t *testing.T, capacity, perClient int) *api {
 		t.Fatalf("session.New: %v", err)
 	}
 	logs := &syncBuffer{}
-	srv := NewServer(m, []string{"http://localhost:3000"}, RateLimits{}, slog.New(slog.NewTextHandler(logs, nil)))
-	return &api{t: t, fake: f, srv: srv, logs: logs}
+	srv := NewServer(m, nil, []string{"http://localhost:3000"}, RateLimits{}, slog.New(slog.NewTextHandler(logs, nil)))
+	return &api{t: t, fake: f, store: store, srv: srv, logs: logs}
 }
 
-// boot does what the reconciler will: it creates the session's VM, so the
-// terminal has something to attach to.
+// boot does what the reconciler does: it creates the session's VM and
+// records it as RUNNING, so the terminal can attach.
 func (a *api) boot(id string) {
 	a.t.Helper()
 	if _, err := a.fake.Create(context.Background(), vm.Spec{ID: id, Image: "fake://os", MemoryMB: 128}); err != nil {
 		a.t.Fatalf("boot %s: %v", id, err)
 	}
+	storetest.SetStatus(a.t, a.store, id, session.StatusRunning)
 }
 
 // do sends a request as the owner of tokenA.
@@ -120,7 +124,7 @@ func wantKeys(t *testing.T, m map[string]any) {
 func TestCreateReturnsTheNewVM(t *testing.T) {
 	a := newAPI(t, 2)
 
-	rec := a.do("POST", "/api/playgrounds")
+	rec := a.do("POST", "/api/v1/playgrounds")
 
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201", rec.Code)
@@ -134,7 +138,7 @@ func TestCreateReturnsTheNewVM(t *testing.T) {
 	if id == "" {
 		t.Fatalf("no id in the body: %v", body)
 	}
-	if loc := rec.Header().Get("Location"); loc != "/api/playgrounds/"+id {
+	if loc := rec.Header().Get("Location"); loc != "/api/v1/playgrounds/"+id {
 		t.Errorf("Location = %q, want /playgrounds/%s", loc, id)
 	}
 	// ADR 0010, section 5: stored, not booted.
@@ -148,9 +152,9 @@ func TestCreateReturnsTheNewVM(t *testing.T) {
 
 func TestGetReturnsTheVMAndNothingAboutTheHost(t *testing.T) {
 	a := newAPI(t, 2)
-	id := decode(t, a.do("POST", "/api/playgrounds"))["id"].(string)
+	id := decode(t, a.do("POST", "/api/v1/playgrounds"))["id"].(string)
 
-	rec := a.do("GET", "/api/playgrounds/"+id)
+	rec := a.do("GET", "/api/v1/playgrounds/"+id)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -168,7 +172,7 @@ func TestGetReturnsTheVMAndNothingAboutTheHost(t *testing.T) {
 func TestUnknownVMIs404WithAJSONError(t *testing.T) {
 	a := newAPI(t, 2)
 
-	rec := a.do("GET", "/api/playgrounds/no-such-vm")
+	rec := a.do("GET", "/api/v1/playgrounds/no-such-vm")
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
@@ -180,10 +184,10 @@ func TestUnknownVMIs404WithAJSONError(t *testing.T) {
 
 func TestNoCapacityIs503WithRetryAfter(t *testing.T) {
 	a := newAPI(t, 2)
-	a.do("POST", "/api/playgrounds")
-	a.do("POST", "/api/playgrounds")
+	a.do("POST", "/api/v1/playgrounds")
+	a.do("POST", "/api/v1/playgrounds")
 
-	rec := a.do("POST", "/api/playgrounds")
+	rec := a.do("POST", "/api/v1/playgrounds")
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
@@ -200,18 +204,18 @@ func TestNoCapacityIs503WithRetryAfter(t *testing.T) {
 // reconciler has removed the VM, so this test leaves room for two.
 func TestDeleteFreesTheQuotaAndThenTheVMIsGone(t *testing.T) {
 	a := newQuotaAPI(t, 2, 1)
-	id := decode(t, a.do("POST", "/api/playgrounds"))["id"].(string)
+	id := decode(t, a.do("POST", "/api/v1/playgrounds"))["id"].(string)
 
-	if rec := a.do("DELETE", "/api/playgrounds/"+id); rec.Code != http.StatusNoContent || rec.Body.Len() != 0 {
+	if rec := a.do("DELETE", "/api/v1/playgrounds/"+id); rec.Code != http.StatusNoContent || rec.Body.Len() != 0 {
 		t.Fatalf("DELETE = %d with body %q, want 204 and none", rec.Code, rec.Body)
 	}
-	if rec := a.do("DELETE", "/api/playgrounds/"+id); rec.Code != http.StatusNotFound {
+	if rec := a.do("DELETE", "/api/v1/playgrounds/"+id); rec.Code != http.StatusNotFound {
 		t.Fatalf("second DELETE = %d, want 404", rec.Code)
 	}
-	if rec := a.do("GET", "/api/playgrounds/"+id); rec.Code != http.StatusNotFound {
+	if rec := a.do("GET", "/api/v1/playgrounds/"+id); rec.Code != http.StatusNotFound {
 		t.Errorf("GET after DELETE = %d, want 404", rec.Code)
 	}
-	if rec := a.do("POST", "/api/playgrounds"); rec.Code != http.StatusCreated {
+	if rec := a.do("POST", "/api/v1/playgrounds"); rec.Code != http.StatusCreated {
 		t.Errorf("POST after DELETE = %d, want 201: the quota was not freed", rec.Code)
 	}
 }
@@ -222,7 +226,7 @@ func TestBusyIs503WithRetryAfterAndItsOwnMessage(t *testing.T) {
 	var logs syncBuffer
 	h := NewVMHandler(brokenVMs{session.ErrBusy}, slog.New(slog.NewTextHandler(&logs, nil)))
 	rec := httptest.NewRecorder()
-	h.Create(rec, httptest.NewRequest("POST", "/api/playgrounds", nil), session.Owner{Hash: hashToken(tokenA)})
+	h.Create(rec, httptest.NewRequest("POST", "/api/v1/playgrounds", nil), session.Owner{Hash: hashToken(tokenA)})
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
@@ -240,8 +244,8 @@ func TestBusyIs503WithRetryAfterAndItsOwnMessage(t *testing.T) {
 
 func TestWrongMethodIs405(t *testing.T) {
 	a := newAPI(t, 1)
-	if rec := a.do("PUT", "/api/playgrounds"); rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("PUT /api/playgrounds = %d, want 405", rec.Code)
+	if rec := a.do("PUT", "/api/v1/playgrounds"); rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("PUT /api/v1/playgrounds = %d, want 405", rec.Code)
 	}
 }
 
@@ -267,9 +271,9 @@ func (b brokenVMs) Delete(context.Context, string, session.Owner) error { return
 // the client in detail. It goes to the log.
 func TestUnexpectedFailuresAre500AndLoggedNotShown(t *testing.T) {
 	tests := []struct{ name, method, path string }{
-		{"create", "POST", "/api/playgrounds"},
-		{"get", "GET", "/api/playgrounds/vm-1"},
-		{"delete", "DELETE", "/api/playgrounds/vm-1"},
+		{"create", "POST", "/api/v1/playgrounds"},
+		{"get", "GET", "/api/v1/playgrounds/vm-1"},
+		{"delete", "DELETE", "/api/v1/playgrounds/vm-1"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -299,7 +303,7 @@ func TestUnexpectedFailuresAre500AndLoggedNotShown(t *testing.T) {
 func TestNewVMHandlerWithoutLoggerDoesNotPanic(t *testing.T) {
 	h := NewVMHandler(brokenVMs{errors.New("boom")}, nil)
 	rec := httptest.NewRecorder()
-	h.Create(rec, httptest.NewRequest("POST", "/api/playgrounds", nil), session.Owner{Hash: hashToken(tokenA)})
+	h.Create(rec, httptest.NewRequest("POST", "/api/v1/playgrounds", nil), session.Owner{Hash: hashToken(tokenA)})
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d", rec.Code)
 	}
@@ -314,7 +318,72 @@ func TestServerShutdownReachesTheTerminalHandler(t *testing.T) {
 		t.Fatalf("Shutdown = %v", err)
 	}
 
-	if rec := a.do("GET", "/api/ws/playgrounds/anything"); rec.Code != http.StatusServiceUnavailable {
+	if rec := a.do("GET", "/api/v1/ws/playgrounds/anything"); rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("terminal route after Shutdown = %d, want 503", rec.Code)
+	}
+}
+
+// Every response carries a fresh request ID, and the same ID reaches the
+// access log and the context the store sees. A client's own is ignored.
+func TestEveryRequestGetsItsOwnID(t *testing.T) {
+	a := newAPI(t, 2)
+	r := httptest.NewRequest("POST", "/api/v1/playgrounds", nil)
+	r.Header.Set("Authorization", "Bearer "+tokenA)
+	r.Header.Set("X-Request-ID", "client-chosen\nfake log line")
+	rec := httptest.NewRecorder()
+	a.srv.ServeHTTP(rec, r)
+
+	id := rec.Header().Get("X-Request-ID")
+	if len(id) != 24 || id == "client-chosen\nfake log line" {
+		t.Fatalf("X-Request-ID = %q, want 24 hex characters chosen by the server", id)
+	}
+	if other := a.do("GET", "/healthz").Header().Get("X-Request-ID"); other == id || other == "" {
+		t.Errorf("second request ID = %q, want a different one", other)
+	}
+	if !strings.Contains(a.logs.String(), "request_id="+id) {
+		t.Errorf("the access log lacks the ID: %s", a.logs.String())
+	}
+
+	sessionID := decode(t, rec)["id"].(string)
+	events, err := a.store.AuditEvents(context.Background(), sessionID)
+	if err != nil || len(events) != 1 || events[0].RequestID != id {
+		t.Errorf("audit events = %+v, %v; want one carrying request ID %s", events, err, id)
+	}
+}
+
+func TestReadyzReportsTheDependency(t *testing.T) {
+	var down error
+	vms := struct {
+		brokenVMs
+		stubProvider
+	}{}
+	srv := NewServer(vms, func(context.Context) error { return down }, nil, RateLimits{}, nil)
+	get := func() int {
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, httptest.NewRequest("GET", "/readyz", nil))
+		return rec.Code
+	}
+
+	if code := get(); code != http.StatusOK {
+		t.Fatalf("/readyz while up = %d, want 200", code)
+	}
+	down = errors.New("connection refused")
+	if code := get(); code != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz while down = %d, want 503", code)
+	}
+}
+
+// ADR 0010, stage 3.7: the unversioned routes are gone, not aliased.
+func TestUnversionedRoutesAreGone(t *testing.T) {
+	a := newAPI(t, 2)
+	for _, tc := range []struct{ method, path string }{
+		{"POST", "/api/playgrounds"},
+		{"GET", "/api/playgrounds/x"},
+		{"DELETE", "/api/playgrounds/x"},
+		{"GET", "/api/ws/playgrounds/x"},
+	} {
+		if rec := a.do(tc.method, tc.path); rec.Code != http.StatusNotFound {
+			t.Errorf("%s %s = %d, want 404", tc.method, tc.path, rec.Code)
+		}
 	}
 }

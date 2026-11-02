@@ -162,4 +162,9 @@ type Provider interface {
 	//
 	// Errors: ErrNotFound, ErrNotRunning, ErrAlreadyAttached.
 	Console(ctx context.Context, id string) (io.ReadWriteCloser, error)
+
+	// List returns every VM Get would find, in no particular order: those
+	// finished but not yet deleted included, those being deleted not. The
+	// application's orphan sweep uses it to find VMs it has no record of.
+	List(ctx context.Context) ([]Instance, error)
 }

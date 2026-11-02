@@ -535,3 +535,34 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+func TestSweepDeletesOnlyOrphans(t *testing.T) {
+	r := newRecRig(t, roomy, nil)
+	kept := r.running(alice)
+	ctx := context.Background()
+	for _, id := range []string{"stranger", "01a19c9b-e5dc-7042-9485-a0f932e85580"} { // no row; a UUID with no row
+		if _, err := r.fake.Create(ctx, vm.Spec{ID: id, Image: testImage, MemoryMB: testMemMB}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	n, err := r.rec.SweepOrphans(ctx)
+	if err != nil || n != 2 {
+		t.Fatalf("SweepOrphans = %d, %v; want 2 deleted", n, err)
+	}
+	if !r.vmExists(kept) || r.fake.Len() != 1 {
+		t.Fatalf("after the sweep: kept exists=%v, %d VMs; want only the session's VM", r.vmExists(kept), r.fake.Len())
+	}
+}
+
+// A session's VM is created only after its row commits, so a sweep can
+// never catch a VM between creation and record.
+func TestSweepKeepsAVMWhoseSessionIsStillStarting(t *testing.T) {
+	r := newRecRig(t, roomy, nil)
+	id := r.create(alice)
+	r.pass(0) // VM created, row PROVISIONING
+
+	if n, err := r.rec.SweepOrphans(context.Background()); err != nil || n != 0 || !r.vmExists(id) {
+		t.Fatalf("SweepOrphans = %d, %v, VM exists=%v; want the VM kept", n, err, r.vmExists(id))
+	}
+}

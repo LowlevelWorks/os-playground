@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"strconv"
 	"strings"
 	"sync"
@@ -99,12 +100,16 @@ func (r *rig) mustCreateAs(o Owner) string {
 	return id
 }
 
-// boot does what the reconciler will: it creates the session's VM.
+// boot does what the reconciler does: it creates the session's VM and
+// records it as RUNNING.
 func (r *rig) boot(id string) {
 	r.t.Helper()
 	if _, err := r.fake.Create(context.Background(), vm.Spec{ID: id, Image: testImage, MemoryMB: testMemMB}); err != nil {
 		r.t.Fatalf("boot %s: %v", id, err)
 	}
+	r.store.mu.Lock()
+	r.store.rows[id].s.Status = StatusRunning
+	r.store.mu.Unlock()
 }
 
 // vmExists asks the provider, not the manager.
@@ -126,6 +131,10 @@ func (s failingStore) Admit(context.Context, NewSession, Limits) (Session, error
 
 func (s failingStore) Get(context.Context, string, string) (Session, error) {
 	return Session{}, s.getErr
+}
+
+func (s failingStore) AcquireAttach(context.Context, string, string, string, time.Duration) error {
+	return s.getErr
 }
 
 func newOver(t *testing.T, s Store) *Manager {
@@ -300,8 +309,8 @@ func TestConsoleReachesTheVMOnceItExists(t *testing.T) {
 	id := r.mustCreateAs(alice)
 	ctx := context.Background()
 
-	if _, err := r.m.Console(ctx, id, alice); !errors.Is(err, vm.ErrNotFound) {
-		t.Fatalf("Console before the VM exists = %v, want the provider's ErrNotFound", err)
+	if _, err := r.m.Console(ctx, id, alice); !errors.Is(err, vm.ErrNotRunning) {
+		t.Fatalf("Console before the session is RUNNING = %v, want ErrNotRunning", err)
 	}
 
 	r.boot(id)
@@ -356,4 +365,139 @@ func TestConcurrentUse(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// runningSession gives alice a RUNNING session with a VM.
+func (r *rig) runningSession() string {
+	r.t.Helper()
+	id := r.mustCreateAs(alice)
+	r.boot(id)
+	return id
+}
+
+// The lease, not the provider, refuses a second console: it holds across
+// replicas, which a provider's own limit cannot.
+func TestSecondConsoleIsRefusedByTheLease(t *testing.T) {
+	r := newRig(t, roomy)
+	id := r.runningSession()
+	ctx := context.Background()
+
+	first, err := r.m.Console(ctx, id, alice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.m.Console(ctx, id, alice); !errors.Is(err, vm.ErrAlreadyAttached) {
+		t.Fatalf("second Console = %v, want ErrAlreadyAttached", err)
+	}
+
+	first.Close()
+	waitFor(t, func() bool {
+		c, err := r.m.Console(ctx, id, alice)
+		if err == nil {
+			c.Close()
+		}
+		return err == nil
+	})
+}
+
+func TestFailedProviderAttachGivesTheLeaseBack(t *testing.T) {
+	r := newRig(t, roomy)
+	id := r.mustCreateAs(alice)
+	r.store.mu.Lock()
+	r.store.rows[id].s.Status = StatusRunning // RUNNING in the row, but no VM
+	r.store.mu.Unlock()
+
+	if _, err := r.m.Console(context.Background(), id, alice); !errors.Is(err, vm.ErrNotFound) {
+		t.Fatalf("Console = %v, want the provider's ErrNotFound", err)
+	}
+	waitFor(t, func() bool {
+		return r.store.AcquireAttach(context.Background(), id, alice.Hash, "other", time.Minute) == nil
+	})
+}
+
+// Deleting the session takes the lease away at the next renewal, which ends
+// the console even if the VM were slow to go.
+func TestLostLeaseEndsTheConsole(t *testing.T) {
+	r := newRig(t, roomy)
+	r.m.attachRenew = 5 * time.Millisecond
+	id := r.runningSession()
+
+	c, err := r.m.Console(context.Background(), id, alice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	ended := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, c)
+		close(ended)
+	}()
+
+	if err := r.m.Delete(context.Background(), id, alice); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ended:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the console outlived its lease")
+	}
+}
+
+// flakyRenew fails RenewAttach while down is set, as a database blip would.
+type flakyRenew struct {
+	*MemStore
+	mu   sync.Mutex
+	down bool
+}
+
+func (s *flakyRenew) setDown(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.down = v
+}
+
+func (s *flakyRenew) RenewAttach(ctx context.Context, id, holder string, lease time.Duration) error {
+	s.mu.Lock()
+	down := s.down
+	s.mu.Unlock()
+	if down {
+		return errors.New("connection refused")
+	}
+	return s.MemStore.RenewAttach(ctx, id, holder, lease)
+}
+
+func TestDatabaseBlipShorterThanTheLeaseKeepsTheConsole(t *testing.T) {
+	r := newRig(t, roomy)
+	store := &flakyRenew{MemStore: r.store}
+	r.m.store = store
+	r.m.attachLease, r.m.attachRenew = 300*time.Millisecond, 5*time.Millisecond
+	id := r.runningSession()
+
+	c, err := r.m.Console(context.Background(), id, alice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	ended := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, c)
+		close(ended)
+	}()
+
+	store.setDown(true)
+	time.Sleep(50 * time.Millisecond) // a blip: well inside the lease
+	store.setDown(false)
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-ended:
+		t.Fatal("a short blip dropped the console")
+	default:
+	}
+
+	store.setDown(true) // an outage: longer than the lease
+	select {
+	case <-ended:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the console outlived a lease it could not renew")
+	}
 }

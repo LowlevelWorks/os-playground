@@ -145,9 +145,11 @@ func (p *PGStore) Admit(ctx context.Context, n NewSession, l Limits) (Session, e
 			return q
 		}
 
-		// TODO(step 7): write the session.created audit event here, in this tx.
 		out, err = insertSession(ctx, tx, n)
-		return err
+		if err != nil {
+			return err
+		}
+		return insertAudit(ctx, tx, createdEvent(ctx, out))
 	})
 	switch {
 	case err == nil:
@@ -182,9 +184,9 @@ func (p *PGStore) Get(ctx context.Context, id, ownerID string) (Session, error) 
 	return s, nil
 }
 
-// RequestDelete implements Store.RequestDelete. It also makes the session due
-// at once, so the reconciler removes the VM on its next pass. Repeating it
-// matches the row again, so it stays idempotent.
+// RequestDelete implements Store.RequestDelete. The row is locked first, so
+// two concurrent calls record one event between them; a repeat changes
+// nothing and records nothing.
 func (p *PGStore) RequestDelete(ctx context.Context, id, ownerID string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -194,16 +196,27 @@ func (p *PGStore) RequestDelete(ctx context.Context, id, ownerID string) error {
 		return ErrNotFound
 	}
 
-	tag, err := p.pool.Exec(ctx, `UPDATE playground_sessions
-		SET desired = 'DELETED', next_attempt_at = now()
-		WHERE id = $1 AND owner_id = $2`, cid, ownerID)
-	if err != nil {
-		return fmt.Errorf("session: request delete: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return database.InTx(ctx, p.pool, func(tx pgx.Tx) error {
+		var deleted bool
+		err := tx.QueryRow(ctx, `SELECT desired = 'DELETED' FROM playground_sessions
+			WHERE id = $1 AND owner_id = $2
+			FOR UPDATE`, cid, ownerID).Scan(&deleted)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			return ErrNotFound
+		case err != nil:
+			return fmt.Errorf("session: request delete: %w", err)
+		case deleted:
+			return nil
+		}
+
+		if _, err := tx.Exec(ctx, `UPDATE playground_sessions
+			SET desired = 'DELETED', next_attempt_at = now()
+			WHERE id = $1`, cid); err != nil {
+			return fmt.Errorf("session: request delete: %w", err)
+		}
+		return insertAudit(ctx, tx, deleteRequestedEvent(ctx, cid, ownerID))
+	})
 }
 
 // Claim implements Store.Claim with FOR UPDATE SKIP LOCKED, so workers
@@ -264,7 +277,23 @@ func (p *PGStore) Complete(ctx context.Context, c Claim, r Result) error {
 		return ErrLeaseLost
 	}
 
-	tag, err := p.pool.Exec(ctx, `UPDATE playground_sessions SET
+	return database.InTx(ctx, p.pool, func(tx pgx.Tx) error {
+		var (
+			old        Status
+			oldDeleted bool
+			ownerID    string
+		)
+		err := tx.QueryRow(ctx, `SELECT status, desired = 'DELETED', owner_id FROM playground_sessions
+			WHERE id = $1 AND claimed_by = $2
+			FOR UPDATE`, c.ID, c.Worker).Scan(&old, &oldDeleted, &ownerID)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			return ErrLeaseLost
+		case err != nil:
+			return fmt.Errorf("session: complete: %w", err)
+		}
+
+		if _, err := tx.Exec(ctx, `UPDATE playground_sessions SET
 			status          = coalesce(nullif($3::text, ''), status),
 			failure_reason  = coalesce(nullif($4::text, ''), failure_reason),
 			desired         = CASE WHEN $5::boolean THEN 'DELETED' ELSE desired END,
@@ -278,14 +307,16 @@ func (p *PGStore) Complete(ctx context.Context, c Claim, r Result) error {
 			claimed_by      = NULL,
 			claim_until     = NULL
 		WHERE id = $1 AND claimed_by = $2`,
-		c.ID, c.Worker, string(r.Status), r.FailureReason, r.DesireDeleted, r.VMReleased, r.Failed, r.RetryAfter)
-	if err != nil {
-		return fmt.Errorf("session: complete: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrLeaseLost
-	}
-	return nil
+			c.ID, c.Worker, string(r.Status), r.FailureReason, r.DesireDeleted, r.VMReleased, r.Failed, r.RetryAfter); err != nil {
+			return fmt.Errorf("session: complete: %w", err)
+		}
+		for _, e := range completeEvents(c.ID, ownerID, old, oldDeleted, r) {
+			if err := insertAudit(ctx, tx, e); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // TouchActivity implements Store.TouchActivity. greatest() keeps a later
@@ -311,6 +342,158 @@ func (p *PGStore) TouchActivity(ctx context.Context, id string, idleFor time.Dur
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
+	}
+	return nil
+}
+
+// insertAudit writes one audit event in tx, so it commits or rolls back with
+// the change it records.
+func insertAudit(ctx context.Context, tx pgx.Tx, e AuditEvent) error {
+	if _, err := tx.Exec(ctx, `INSERT INTO audit_events
+			(event_type, request_id, user_id, session_id, metadata)
+		VALUES ($1, nullif($2, ''), $3, $4, $5)`,
+		e.Type, e.RequestID, e.UserID, e.SessionID, metadataJSON(e.Metadata)); err != nil {
+		return fmt.Errorf("session: audit %s: %w", e.Type, err)
+	}
+	return nil
+}
+
+// AuditEvents returns the events recorded for a session, oldest first. It
+// is for tests and operators and is not part of Store.
+func (p *PGStore) AuditEvents(ctx context.Context, sessionID string) ([]AuditEvent, error) {
+	rows, err := p.pool.Query(ctx, `SELECT occurred_at, event_type, coalesce(request_id, ''),
+			coalesce(user_id, ''), coalesce(session_id, ''), metadata
+		FROM audit_events
+		WHERE session_id = $1
+		ORDER BY id`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("session: audit events: %w", err)
+	}
+	events, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (AuditEvent, error) {
+		var e AuditEvent
+		err := row.Scan(&e.OccurredAt, &e.Type, &e.RequestID, &e.UserID, &e.SessionID, &e.Metadata)
+		return e, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("session: audit events: %w", err)
+	}
+	return events, nil
+}
+
+// HoldingVM implements Store.HoldingVM. It matches the sessions_holding_vm
+// index. IDs that are not canonical UUIDs cannot be session IDs, so they are
+// dropped before the query rather than failing the cast.
+func (p *PGStore) HoldingVM(ctx context.Context, ids []string) (map[string]bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	valid := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if cid, ok := canonicalID(id); ok && cid == id {
+			valid = append(valid, id)
+		}
+	}
+	out := make(map[string]bool)
+	if len(valid) == 0 {
+		return out, nil
+	}
+
+	rows, err := p.pool.Query(ctx, `SELECT id::text FROM playground_sessions
+		WHERE id = ANY($1::uuid[]) AND vm_released_at IS NULL`, valid)
+	if err != nil {
+		return nil, fmt.Errorf("session: holding vm: %w", err)
+	}
+	held, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("session: holding vm: %w", err)
+	}
+	for _, id := range held {
+		out[id] = true
+	}
+	return out, nil
+}
+
+// AcquireAttach implements Store.AcquireAttach with one conditional UPDATE,
+// so two consoles racing for the lease cannot both win. Only when it matches
+// nothing does a second query say why.
+func (p *PGStore) AcquireAttach(ctx context.Context, id, ownerID, holder string, lease time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if holder == "" || lease <= 0 {
+		return ErrInvalid
+	}
+	cid, ok := canonicalID(id)
+	if !ok || ownerID == "" {
+		return ErrNotFound
+	}
+
+	tag, err := p.pool.Exec(ctx, `UPDATE playground_sessions
+		SET attach_holder = $3, attach_lease_until = now() + $4::interval
+		WHERE id = $1 AND owner_id = $2 AND desired = 'RUNNING' AND status = 'RUNNING'
+		  AND (attach_holder IS NULL OR attach_holder = $3 OR attach_lease_until < now())`,
+		cid, ownerID, holder, lease)
+	if err != nil {
+		return fmt.Errorf("session: acquire attach: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+
+	var notAttachable bool
+	err = p.pool.QueryRow(ctx, `SELECT desired = 'DELETED' OR status <> 'RUNNING'
+		FROM playground_sessions
+		WHERE id = $1 AND owner_id = $2`, cid, ownerID).Scan(&notAttachable)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return ErrNotFound
+	case err != nil:
+		return fmt.Errorf("session: acquire attach: %w", err)
+	case notAttachable:
+		return ErrNotAttachable
+	}
+	return ErrAttached
+}
+
+// RenewAttach implements Store.RenewAttach.
+func (p *PGStore) RenewAttach(ctx context.Context, id, holder string, lease time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if holder == "" || lease <= 0 {
+		return ErrInvalid
+	}
+	cid, ok := canonicalID(id)
+	if !ok {
+		return ErrLeaseLost
+	}
+
+	tag, err := p.pool.Exec(ctx, `UPDATE playground_sessions
+		SET attach_lease_until = now() + $3::interval
+		WHERE id = $1 AND attach_holder = $2 AND desired = 'RUNNING'`, cid, holder, lease)
+	if err != nil {
+		return fmt.Errorf("session: renew attach: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+// ReleaseAttach implements Store.ReleaseAttach.
+func (p *PGStore) ReleaseAttach(ctx context.Context, id, holder string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	cid, ok := canonicalID(id)
+	if !ok || holder == "" {
+		return nil
+	}
+
+	if _, err := p.pool.Exec(ctx, `UPDATE playground_sessions
+		SET attach_holder = NULL, attach_lease_until = NULL
+		WHERE id = $1 AND attach_holder = $2`, cid, holder); err != nil {
+		return fmt.Errorf("session: release attach: %w", err)
 	}
 	return nil
 }

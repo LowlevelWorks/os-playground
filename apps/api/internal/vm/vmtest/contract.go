@@ -63,6 +63,7 @@ var cases = []struct {
 	{"create returns an instance", createReturnsInstance},
 	{"duplicate id is rejected", duplicateID},
 	{"get unknown id", getUnknown},
+	{"list shows live vms", listShowsLiveVMs},
 	{"vm reaches running", reachesRunning},
 	{"cancelled create creates nothing", cancelledCreate},
 	{"cancelled context on other methods", cancelledOtherMethods},
@@ -485,5 +486,33 @@ func concurrentDeletes(h *harness) {
 
 	if _, err := h.p.Get(ctx, inst.ID); !errors.Is(err, vm.ErrNotFound) {
 		t.Errorf("Get after concurrent Deletes = %v, want ErrNotFound", err)
+	}
+}
+
+func listShowsLiveVMs(h *harness) {
+	t := h.t
+	a, b := h.create(), h.create()
+
+	ids := func() map[string]bool {
+		t.Helper()
+		insts, err := h.p.List(h.ctx())
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		set := make(map[string]bool, len(insts))
+		for _, inst := range insts {
+			set[inst.ID] = true
+		}
+		return set
+	}
+
+	if got := ids(); !got[a.ID] || !got[b.ID] {
+		t.Fatalf("List = %v, want it to include %s and %s", got, a.ID, b.ID)
+	}
+	if err := h.p.Delete(h.ctx(), a.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := ids(); got[a.ID] || !got[b.ID] {
+		t.Fatalf("List after deleting %s = %v, want only %s of the two", a.ID, got, b.ID)
 	}
 }

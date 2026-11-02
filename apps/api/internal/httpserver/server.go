@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"time"
 )
 
 // Server is the HTTP side of the application. It is an http.Handler.
@@ -15,10 +16,15 @@ type Server struct {
 	terminal *TerminalHandler
 }
 
-// NewServer wires the routes and middleware. allowedOrigins are the full
-// origins (scheme://host[:port]) permitted to call the API; the WebSocket
-// handler uses the host-only form for its own check, derived here.
-func NewServer(manager VMManager, allowedOrigins []string, limits RateLimits, log *slog.Logger) *Server {
+// readyTimeout bounds one readiness check.
+const readyTimeout = 2 * time.Second
+
+// NewServer wires the routes and middleware. ready reports whether the
+// server's dependencies, such as the database, can serve requests; nil means
+// always ready. allowedOrigins are the full origins (scheme://host[:port])
+// permitted to call the API; the WebSocket handler uses the host-only form
+// for its own check, derived here.
+func NewServer(manager VMManager, ready func(context.Context) error, allowedOrigins []string, limits RateLimits, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -34,7 +40,22 @@ func NewServer(manager VMManager, allowedOrigins []string, limits RateLimits, lo
 	mux.HandleFunc("OPTIONS "+apiPrefix+"/playgrounds/{id}", func(w http.ResponseWriter, r *http.Request) {})
 	terminalRoute(mux, terminal, limits.TrustedProxyHops)
 	// Outside the prefix: probes hit it directly, not through the web proxy.
+	// /healthz is liveness: the process answers. /readyz is readiness: it
+	// can also reach what it depends on, so a load balancer stops sending
+	// traffic while the database is down (ADR 0010, section 12).
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok\n")
+	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		if ready != nil {
+			ctx, cancel := context.WithTimeout(r.Context(), readyTimeout)
+			defer cancel()
+			if err := ready(ctx); err != nil {
+				log.Warn("not ready", "err", err)
+				http.Error(w, "not ready", http.StatusServiceUnavailable)
+				return
+			}
+		}
 		_, _ = io.WriteString(w, "ok\n")
 	})
 
@@ -44,13 +65,16 @@ func NewServer(manager VMManager, allowedOrigins []string, limits RateLimits, lo
 	h = cors(allowedOrigins, h)
 	h = recoverPanic(log, h)
 	h = accessLog(log, h)
+	h = requestID(h) // outside the access log, which records the ID
 	return &Server{handler: h, terminal: terminal}
 }
 
-// apiPrefix is where every API route lives. Routes are registered with it
+// apiPrefix is where every API route lives, versioned so a breaking change
+// can be served beside the old routes (ADR 0010, stage 3.7). The web app's
+// base stays "/api"; it adds "/v1" itself. Routes are registered with it
 // rather than behind http.StripPrefix, which hands the inner mux a copy of the
 // request: the access log would then never see the matched pattern.
-const apiPrefix = "/api"
+const apiPrefix = "/api/v1"
 
 // vmRoutes mounts the REST endpoints. Every one goes through withOwner, so no
 // handler runs without a verified owner. Tests mount routes with this too.

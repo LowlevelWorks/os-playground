@@ -14,13 +14,13 @@ import (
 func TestAccessLogRecordsTheRouteNotTheVMID(t *testing.T) {
 	a := newAPI(t, 1)
 
-	a.do("GET", "/api/playgrounds/vm-topsecret0123456789")
+	a.do("GET", "/api/v1/playgrounds/vm-topsecret0123456789")
 
 	out := a.logs.String()
 	if strings.Contains(out, "topsecret") {
 		t.Fatalf("the access log contains a VM ID: %s", out)
 	}
-	if !strings.Contains(out, "GET /api/playgrounds/{id}") || !strings.Contains(out, "status=404") {
+	if !strings.Contains(out, "GET /api/v1/playgrounds/{id}") || !strings.Contains(out, "status=404") {
 		t.Fatalf("the access log lacks the route or status: %s", out)
 	}
 }

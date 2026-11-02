@@ -27,6 +27,7 @@ const (
 	defaultBatch       = 8
 	defaultStepTimeout = 10 * time.Second
 	defaultMaxAttempts = 5
+	defaultSweep       = time.Minute
 
 	changingRetry = time.Second
 	runningRetry  = 5 * time.Second
@@ -56,6 +57,9 @@ type ReconcilerConfig struct {
 	Batch       int           // sessions claimed, and worked on concurrently, per pass
 	StepTimeout time.Duration // bound on the provider calls for one session
 	MaxAttempts int           // failed creates before the session is FAILED
+	// SweepInterval is how often the orphan sweep runs (ADR 0010, section
+	// 6.4). It also runs once when Run starts.
+	SweepInterval time.Duration
 
 	Logger *slog.Logger // nil discards
 }
@@ -73,6 +77,7 @@ type Reconciler struct {
 	batch    int
 	timeout  time.Duration
 	attempts int
+	sweep    time.Duration
 	log      *slog.Logger
 
 	now  func() time.Time // replaced in tests
@@ -91,7 +96,9 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 	if cfg.FailedVisibleFor <= 0 {
 		errs = append(errs, fmt.Errorf("session: FailedVisibleFor=%s: must be greater than 0", cfg.FailedVisibleFor))
 	}
-	for name, v := range map[string]time.Duration{"Interval": cfg.Interval, "Lease": cfg.Lease, "StepTimeout": cfg.StepTimeout} {
+	for name, v := range map[string]time.Duration{
+		"Interval": cfg.Interval, "Lease": cfg.Lease, "StepTimeout": cfg.StepTimeout, "SweepInterval": cfg.SweepInterval,
+	} {
 		if v < 0 {
 			errs = append(errs, fmt.Errorf("session: %s=%s: must not be negative", name, v))
 		}
@@ -113,6 +120,7 @@ func NewReconciler(cfg ReconcilerConfig) (*Reconciler, error) {
 		batch:    cmp.Or(cfg.Batch, defaultBatch),
 		timeout:  cmp.Or(cfg.StepTimeout, defaultStepTimeout),
 		attempts: cmp.Or(cfg.MaxAttempts, defaultMaxAttempts),
+		sweep:    cmp.Or(cfg.SweepInterval, defaultSweep),
 		log:      cfg.Logger,
 		now:      time.Now,
 		wake:     make(chan struct{}, 1),
@@ -147,10 +155,14 @@ func (r *Reconciler) Wake() {
 }
 
 // Run reconciles until ctx ends: at every tick, on every Wake, and again at
-// once while passes come back full.
+// once while passes come back full. It sweeps orphans at start and every
+// SweepInterval.
 func (r *Reconciler) Run(ctx context.Context) {
 	t := time.NewTicker(r.interval)
 	defer t.Stop()
+	sweep := time.NewTicker(r.sweep)
+	defer sweep.Stop()
+	r.sweepLogged(ctx)
 	for {
 		for ctx.Err() == nil {
 			n, err := r.ReconcileOnce(ctx)
@@ -166,8 +178,56 @@ func (r *Reconciler) Run(ctx context.Context) {
 			return
 		case <-t.C:
 		case <-r.wake:
+		case <-sweep.C:
+			r.sweepLogged(ctx)
 		}
 	}
+}
+
+func (r *Reconciler) sweepLogged(ctx context.Context) {
+	if _, err := r.SweepOrphans(ctx); err != nil && ctx.Err() == nil {
+		r.log.Error("orphan sweep failed", "err", err)
+	}
+}
+
+// SweepOrphans deletes every provider VM that no session holds, and returns
+// how many it deleted. This is safe because a session row is committed
+// before its VM is created, and rows are never hard-deleted: a VM without an
+// unreleased row was left behind by something, never about to be used.
+func (r *Reconciler) SweepOrphans(ctx context.Context) (int, error) {
+	insts, err := r.provider.List(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("list vms: %w", err)
+	}
+	if len(insts) == 0 {
+		return 0, nil
+	}
+	ids := make([]string, len(insts))
+	for i, inst := range insts {
+		ids[i] = inst.ID
+	}
+	held, err := r.store.HoldingVM(ctx, ids)
+	if err != nil {
+		return 0, fmt.Errorf("holding vm: %w", err)
+	}
+
+	deleted := 0
+	var errs []error
+	for _, id := range ids {
+		if held[id] {
+			continue
+		}
+		dctx, cancel := context.WithTimeout(ctx, r.timeout)
+		err := r.provider.Delete(dctx, id)
+		cancel()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("delete orphan %s: %w", id, err))
+			continue
+		}
+		deleted++
+		r.log.Warn("orphan vm deleted", "vm_id", id)
+	}
+	return deleted, errors.Join(errs...)
 }
 
 // ReconcileOnce claims one batch of due sessions, takes one step for each,
@@ -225,7 +285,7 @@ func (r *Reconciler) step(ctx context.Context, c Claim) Result {
 			reason = "idle"
 		}
 		r.log.Info("session expired", "session_id", c.ID, "reason", reason)
-		return Result{DesireDeleted: true}
+		return Result{DesireDeleted: true, ExpireReason: reason}
 	}
 	if c.Status == StatusCreated {
 		return r.create(ctx, c)

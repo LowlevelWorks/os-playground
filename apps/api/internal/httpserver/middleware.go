@@ -2,12 +2,16 @@ package httpserver
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"log/slog"
 	"net"
 	"net/http"
 	"runtime/debug"
 	"strings"
 	"time"
+
+	"github.com/os-playground-api/internal/session"
 )
 
 // statusRecorder remembers the status code for the access log. It must stay
@@ -58,10 +62,25 @@ func accessLog(log *slog.Logger, next http.Handler) http.Handler {
 			route = "unmatched"
 		}
 		log.Info("http request",
+			"request_id", session.RequestID(r.Context()),
 			"route", route,
 			"status", rec.status,
 			"duration", time.Since(start),
 		)
+	})
+}
+
+// requestID gives every request a random ID: in the context, so the audit
+// events it causes carry it; in the access log; and in X-Request-ID, so a
+// user's report can be matched to both. A client's own X-Request-ID is
+// ignored: trusting it would let anyone write text into the audit trail.
+func requestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b := make([]byte, 12)
+		_, _ = rand.Read(b) // never fails on supported platforms
+		id := hex.EncodeToString(b)
+		w.Header().Set("X-Request-ID", id)
+		next.ServeHTTP(w, r.WithContext(session.WithRequestID(r.Context(), id)))
 	})
 }
 

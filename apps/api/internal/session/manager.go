@@ -14,6 +14,8 @@ package session
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,6 +36,13 @@ const defaultProfile = "default"
 const (
 	activityThrottle = 15 * time.Second
 	touchTimeout     = 5 * time.Second
+)
+
+// The console attach lease (ADR 0010, section 7): renewed every
+// defaultAttachRenew, it lapses defaultAttachLease after a replica dies.
+const (
+	defaultAttachLease = 30 * time.Second
+	defaultAttachRenew = 10 * time.Second
 )
 
 // ErrQuota matches every *QuotaError.
@@ -100,7 +109,9 @@ type Manager struct {
 	wake     func()
 	log      *slog.Logger
 
-	now func() time.Time // replaced in tests
+	attachLease time.Duration // replaced in tests
+	attachRenew time.Duration // replaced in tests
+	now         func() time.Time
 }
 
 // vmSpec is what Session.Spec holds: what the reconciler needs to build a
@@ -169,6 +180,9 @@ func New(cfg Config) (*Manager, error) {
 		wake: cfg.Wake,
 		log:  cfg.Logger,
 		now:  time.Now,
+
+		attachLease: defaultAttachLease,
+		attachRenew: defaultAttachRenew,
 	}, nil
 }
 
@@ -224,32 +238,83 @@ func (m *Manager) Delete(ctx context.Context, id string, o Owner) error {
 	return nil
 }
 
-// Console attaches to the VM of a session o owns. The provider refuses a VM
-// that does not exist yet or is not running, and a second attach while it
-// can hold only one. Input written to the console counts as activity and
-// pushes the idle deadline out; attaching alone does not.
-//
-// TODO: the attach lease in the row (ADR 0010, section 7). It matters only
-// with several replicas, which the local provider does not support.
+// Console attaches to the VM of a session o owns (ADR 0010, section 7).
+// The session must be RUNNING and not being deleted, and one console at a
+// time holds its attach lease, in the row, so this holds across replicas.
+// The lease is renewed while the console is open and released on Close.
+// Input written to the console counts as activity and pushes the idle
+// deadline out; attaching alone does not.
 func (m *Manager) Console(ctx context.Context, id string, o Owner) (io.ReadWriteCloser, error) {
-	s, err := m.visible(ctx, id, o)
+	holder := newHolderID()
+	if err := m.store.AcquireAttach(ctx, id, o.Hash, holder, m.attachLease); err != nil {
+		switch {
+		case errors.Is(err, ErrNotFound):
+			return nil, notFound(id)
+		case errors.Is(err, ErrNotAttachable):
+			// A session being deleted is hidden (ADR 0010, section 4): it
+			// must look missing here too, as it does to Get.
+			if _, verr := m.visible(ctx, id, o); verr != nil {
+				return nil, verr
+			}
+			return nil, fmt.Errorf("%w: %s", err, id)
+		case errors.Is(err, ErrAttached):
+			return nil, fmt.Errorf("%w: %s", err, id)
+		default:
+			return nil, fmt.Errorf("session: acquire attach: %w", err)
+		}
+	}
+	// AcquireAttach succeeded, so id parses; the provider knows the
+	// canonical form only.
+	cid, _ := canonicalID(id)
+
+	conn, err := m.provider.Console(ctx, cid)
 	if err != nil {
+		m.releaseAttach(cid, holder)
 		return nil, err
 	}
-	c, err := m.provider.Console(ctx, s.ID)
-	if err != nil {
-		return nil, err
+	c := &activeConsole{
+		ReadWriteCloser: conn,
+		m:               m,
+		id:              cid,
+		holder:          holder,
+		stop:            make(chan struct{}),
 	}
-	return &activeConsole{ReadWriteCloser: c, m: m, id: s.ID}, nil
+	c.closeConn = sync.OnceValue(conn.Close)
+	go c.heartbeat() //nolint:gosec // G118: lives as long as the console, ended by Close, not by the attach request
+	return c, nil
 }
 
-// activeConsole records input as activity, throttled, without ever making a
-// keystroke wait for the database: the write happens in the background, one
-// at a time.
+// releaseAttach gives the lease back in the background: Close must not wait
+// on the database. If it fails, the lease simply expires.
+func (m *Manager) releaseAttach(id, holder string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), touchTimeout)
+		defer cancel()
+		if err := m.store.ReleaseAttach(ctx, id, holder); err != nil {
+			m.log.Warn("release console lease failed; it will expire", "session_id", id, "err", err)
+		}
+	}()
+}
+
+// newHolderID names one console attachment in the lease column.
+func newHolderID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b) // never fails on supported platforms
+	return hex.EncodeToString(b)
+}
+
+// activeConsole is an attached console: it keeps the attach lease renewed,
+// and records input as activity, throttled, without ever making a keystroke
+// wait for the database.
 type activeConsole struct {
 	io.ReadWriteCloser
-	m  *Manager
-	id string
+	m      *Manager
+	id     string
+	holder string
+
+	closeConn func() error // conn.Close, at most once
+	stop      chan struct{}
+	stopOnce  sync.Once
 
 	mu       sync.Mutex
 	last     time.Time
@@ -259,6 +324,51 @@ type activeConsole struct {
 func (c *activeConsole) Write(p []byte) (int, error) {
 	c.touch()
 	return c.ReadWriteCloser.Write(p)
+}
+
+// Close detaches and releases the lease. It is safe to call more than once.
+func (c *activeConsole) Close() error {
+	err := c.closeConn()
+	c.stopOnce.Do(func() {
+		close(c.stop)
+		c.m.releaseAttach(c.id, c.holder)
+	})
+	return err
+}
+
+// heartbeat renews the lease until Close. If the lease is lost (the session
+// is being deleted, or another replica took an expired lease) it ends the
+// console at once. Other errors are tolerated until the lease would really
+// have expired, so a short database blip does not drop a terminal.
+func (c *activeConsole) heartbeat() {
+	t := time.NewTicker(c.m.attachRenew)
+	defer t.Stop()
+	lastOK := time.Now()
+	for {
+		select {
+		case <-c.stop:
+			return
+		case <-t.C:
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), touchTimeout)
+		err := c.m.store.RenewAttach(ctx, c.id, c.holder, c.m.attachLease)
+		cancel()
+		switch {
+		case err == nil:
+			lastOK = time.Now()
+			continue
+		case errors.Is(err, ErrLeaseLost):
+			c.m.log.Info("console lease lost; detaching", "session_id", c.id)
+		case time.Since(lastOK) < c.m.attachLease:
+			c.m.log.Warn("console lease renewal failed; will retry", "session_id", c.id, "err", err)
+			continue
+		default:
+			c.m.log.Warn("console lease expired; detaching", "session_id", c.id, "err", err)
+		}
+		_ = c.closeConn() // the reader sees EOF; the caller's Close finishes up
+		return
+	}
 }
 
 func (c *activeConsole) touch() {

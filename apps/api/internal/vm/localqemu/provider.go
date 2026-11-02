@@ -234,6 +234,27 @@ func (p *Provider) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+// List implements vm.Provider.
+func (p *Provider) List(ctx context.Context) ([]vm.Instance, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	procs := make([]*process, 0, len(p.vms))
+	for _, e := range p.vms {
+		if !e.deleting {
+			procs = append(procs, e.proc)
+		}
+	}
+	p.mu.Unlock()
+
+	out := make([]vm.Instance, len(procs))
+	for i, proc := range procs {
+		out[i] = proc.snapshot()
+	}
+	return out, nil
+}
+
 // Console implements vm.Provider.
 func (p *Provider) Console(ctx context.Context, id string) (io.ReadWriteCloser, error) {
 	if err := ctx.Err(); err != nil {
