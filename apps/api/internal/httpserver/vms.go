@@ -63,7 +63,9 @@ func NewVMHandler(svc vmService, log *slog.Logger) *VMHandler {
 	return &VMHandler{svc: svc, log: log}
 }
 
-// Create handles POST /playgrounds. It takes no body: the server chooses everything.
+// Create handles POST /playgrounds. It takes no body: the server chooses
+// everything. The VM is booted later, so the answer is 201 with status
+// provisioning, and the client polls GET.
 func (h *VMHandler) Create(w http.ResponseWriter, r *http.Request, o session.Owner) {
 	v, err := h.svc.Create(r.Context(), o)
 	var quota *session.QuotaError
@@ -76,6 +78,13 @@ func (h *VMHandler) Create(w http.ResponseWriter, r *http.Request, o session.Own
 	case errors.Is(err, vm.ErrCapacity):
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds))
 		writeError(w, http.StatusServiceUnavailable, "no capacity right now; try again shortly")
+		return
+	case errors.Is(err, session.ErrBusy):
+		// Overloaded, not full: a different message so logs and the client
+		// can tell the two apart. Logged, because it should be rare.
+		h.log.Warn("create vm: admission lock busy", "err", err)
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds))
+		writeError(w, http.StatusServiceUnavailable, "server busy; try again shortly")
 		return
 	case r.Context().Err() != nil:
 		return // the client gave up
@@ -117,8 +126,8 @@ func (h *VMHandler) Delete(w http.ResponseWriter, r *http.Request, o session.Own
 	case errors.Is(err, vm.ErrNotFound):
 		vmNotFound(w, r)
 	case r.Context().Err() != nil:
-		// The client gave up. The VM is already hidden, and the reaper finishes
-		// the deletion.
+		// The client gave up. Whether the mark was stored is unknown; a
+		// retried DELETE answers 204 or 404, and either means it is going.
 	default:
 		h.log.Error("delete vm failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "internal error")

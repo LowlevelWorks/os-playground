@@ -48,6 +48,25 @@ jobs:
     defaults:
       run:
         working-directory: apps/api
+    # The Store contract runs against this database (internal/session,
+    # TestPGStoreContract). CI=true makes that test fail, not skip, without it.
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: playground
+          POSTGRES_PASSWORD: playground
+          POSTGRES_DB: playground
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U playground -d playground"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      PLAYGROUND_DATABASE_URL: postgres://playground:playground@localhost:5432/playground?sslmode=disable
+      PLAYGROUND_TEST_DATABASE_URL: postgres://playground:playground@localhost:5432/playground?sslmode=disable
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -58,6 +77,7 @@ jobs:
           cache-dependency-path: apps/api/go.sum
 
       - run: make tidy-check
+      - run: make migrate
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0

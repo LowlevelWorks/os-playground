@@ -1,22 +1,20 @@
 // Package session is the application's record of the VMs it created. It sits
-// between the HTTP handlers and a vm.Provider: it chooses every VM's spec,
-// hides a VM from clients once it is being deleted, and removes VMs that have
-// finished, sat unused, or lived too long. Every VM belongs to the Owner that
-// created it, and nobody else can see it.
+// between the HTTP handlers and the Store: it chooses every session's spec,
+// hides a session from clients once it is being deleted, and lets only the
+// Owner that created a session see it.
 //
-// The provider has no List and frees a VM's capacity slot only on Delete, so
-// without this bookkeeping a crashed VM would hold its slot forever.
+// Handlers change desired state only (ADR 0010, section 2): Create inserts a
+// row and Delete marks it, and neither calls the provider. A reconciler, not
+// yet written (stage 3.4), boots and removes the VMs. Console is the one
+// exception: it reaches the provider directly once ownership is checked.
 //
-// Store is the durable record that replaces the Manager's in-memory one (ADR
-// 0010): PostgreSQL in production, MemStore in tests. Both must pass
-// storetest.Run.
+// Store is the durable record: PostgreSQL in production, MemStore in tests.
+// Both must pass storetest.Run.
 package session
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/subtle"
-	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -27,7 +25,16 @@ import (
 	"github.com/os-playground-api/internal/vm"
 )
 
-const defaultGrace = 30 * time.Second
+// defaultProfile is the only profile until profiles are configurable.
+const defaultProfile = "default"
+
+// Console input is recorded at most this often per console, so idle
+// accuracy is about this long and the database sees few writes (ADR 0010,
+// section 7). touchTimeout bounds one write.
+const (
+	activityThrottle = 15 * time.Second
+	touchTimeout     = 5 * time.Second
+)
 
 // ErrQuota matches every *QuotaError.
 var ErrQuota = errors.New("session: quota reached")
@@ -36,11 +43,9 @@ var ErrQuota = errors.New("session: quota reached")
 // already holds its share. ClientWide tells which limit was reached; Yours
 // tells whether the caller can resume a session of its own instead.
 type QuotaError struct {
-	// Yours is true when one of those VMs, or a create still in flight,
-	// belongs to the caller's own token.
+	// Yours is true when the caller's own token holds a live session.
 	Yours bool
-	// ID is the caller's oldest live VM. It is empty unless Yours, and empty
-	// while the caller's only VM is still being created.
+	// ID is the caller's oldest live session. It is empty unless Yours.
 	ID string
 
 	// ClientWide is set when the per-client limit was reached rather than
@@ -62,53 +67,55 @@ type Owner struct {
 	Client string
 }
 
-// Config configures a Manager. Every field except Grace and Logger is
-// required; New reports all missing or invalid fields at once.
+// Config configures a Manager. Every field except Wake and Logger is required; New
+// reports all missing or invalid fields at once.
 type Config struct {
+	Store Store
+	// Provider is used for Console only. Creating and deleting VMs is the
+	// reconciler's job.
 	Provider     vm.Provider
-	Image        string // absolute path, already validated by config
-	MemoryMB     int
-	MaxPerOwner  int           // live VMs one Owner.Hash may hold, on any Client, counting creates in flight
-	MaxPerClient int           // live VMs one Client may hold, counting creates in flight
+	Image        string        // absolute path, already validated by config
+	MemoryMB     int           // guest RAM, stored in each session's spec
+	Capacity     int           // sessions that may hold a VM at once
+	MaxPerOwner  int           // live sessions one Owner.Hash may hold, on any Client
+	MaxPerClient int           // live sessions one Client may hold, across owners
 	IdleTimeout  time.Duration // no browser attached for this long -> delete
 	MaxDuration  time.Duration // hard lifetime -> delete
-	Grace        time.Duration // a finished VM stays readable this long; zero means 30s
-	Logger       *slog.Logger  // nil discards
+	// Wake, if set, is called after a session is admitted or marked for
+	// deletion, so the reconciler acts at once instead of at its next poll.
+	Wake   func()
+	Logger *slog.Logger // nil discards
 }
 
-// Manager is safe for concurrent use. It never calls the provider while
-// holding its lock: provider calls can block for seconds.
+// Manager is safe for concurrent use: it holds no state of its own beyond
+// its configuration, and the Store serialises admissions.
 type Manager struct {
-	provider         vm.Provider
-	image            string
-	memoryMB         int
-	perOwner         int
-	perClient        int
-	idle, max, grace time.Duration
-	log              *slog.Logger
+	store    Store
+	provider vm.Provider
+	image    string
+	spec     json.RawMessage // the same for every session; marshalled once in New
+	limits   Limits
+	idle     time.Duration
+	max      time.Duration
+	wake     func()
+	log      *slog.Logger
 
-	now   func() time.Time // replaced in tests
-	newID func() string    // replaced in tests
-
-	mu       sync.Mutex
-	sessions map[string]*session
-	pending  map[string]map[string]int // client -> owner hash -> creates in flight
+	now func() time.Time // replaced in tests
 }
 
-type session struct {
-	owner         string // Owner.Hash
-	client        string // Owner.Client
-	created       time.Time
-	attachers     int       // open consoles, plus attach attempts in flight
-	idleSince     time.Time // when attachers last became 0 (starts at created)
-	terminalSince time.Time // zero until the VM is first seen finished
-	deleting      bool      // hidden from clients; Reap finishes the job
+// vmSpec is what Session.Spec holds: what the reconciler needs to build a
+// vm.Spec, apart from the ID (the session ID) and the image (ImageRef).
+type vmSpec struct {
+	MemoryMB int `json:"memory_mb"`
 }
 
-// New checks the configuration. A zero timeout would make the reaper delete
-// every VM on its first pass, so it is rejected, not defaulted.
+// New checks the configuration. A zero timeout would expire every session at
+// once, so it is rejected, not defaulted.
 func New(cfg Config) (*Manager, error) {
 	var errs []error
+	if cfg.Store == nil {
+		errs = append(errs, errors.New("session: Store is required"))
+	}
 	if cfg.Provider == nil {
 		errs = append(errs, errors.New("session: Provider is required"))
 	}
@@ -117,6 +124,9 @@ func New(cfg Config) (*Manager, error) {
 	}
 	if cfg.MemoryMB <= 0 {
 		errs = append(errs, fmt.Errorf("session: MemoryMB=%d: must be greater than 0", cfg.MemoryMB))
+	}
+	if cfg.Capacity <= 0 {
+		errs = append(errs, fmt.Errorf("session: Capacity=%d: must be greater than 0", cfg.Capacity))
 	}
 	if cfg.MaxPerOwner <= 0 {
 		errs = append(errs, fmt.Errorf("session: MaxPerOwner=%d: must be greater than 0", cfg.MaxPerOwner))
@@ -130,342 +140,194 @@ func New(cfg Config) (*Manager, error) {
 	if cfg.MaxDuration <= 0 {
 		errs = append(errs, fmt.Errorf("session: MaxDuration=%s: must be greater than 0", cfg.MaxDuration))
 	}
-	if cfg.Grace < 0 {
-		errs = append(errs, fmt.Errorf("session: Grace=%s: must not be negative", cfg.Grace))
-	}
 	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
 
-	if cfg.Grace == 0 {
-		cfg.Grace = defaultGrace
+	spec, err := json.Marshal(vmSpec{MemoryMB: cfg.MemoryMB})
+	if err != nil {
+		return nil, fmt.Errorf("session: marshal spec: %w", err)
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
+	if cfg.Wake == nil {
+		cfg.Wake = func() {}
+	}
 	return &Manager{
-		provider:  cfg.Provider,
-		image:     cfg.Image,
-		memoryMB:  cfg.MemoryMB,
-		perOwner:  cfg.MaxPerOwner,
-		perClient: cfg.MaxPerClient,
-		idle:      cfg.IdleTimeout,
-		max:       cfg.MaxDuration,
-		grace:     cfg.Grace,
-		log:       cfg.Logger,
-		now:       time.Now,
-		newID:     newVMID,
-		sessions:  make(map[string]*session),
-		pending:   make(map[string]map[string]int),
+		store:    cfg.Store,
+		provider: cfg.Provider,
+		image:    cfg.Image,
+		spec:     spec,
+		limits: Limits{
+			Capacity:  cfg.Capacity,
+			PerOwner:  cfg.MaxPerOwner,
+			PerClient: cfg.MaxPerClient,
+		},
+		idle: cfg.IdleTimeout,
+		max:  cfg.MaxDuration,
+		wake: cfg.Wake,
+		log:  cfg.Logger,
+		now:  time.Now,
 	}, nil
 }
 
-// newVMID need not be secret, since the owner check guards every VM, but an
-// unguessable ID is a second line of defence.
-func newVMID() string {
-	b := make([]byte, 10)
-	if _, err := rand.Read(b); err != nil {
-		panic(err) // crypto/rand failing means the OS is broken
-	}
-	return "vm-" + hex.EncodeToString(b)
-}
-
-// Create starts a VM for o. The caller never chooses the ID, image or size.
-// A client at its limit gets a *QuotaError before the provider is asked;
-// provider errors come back unchanged, so errors.Is(err, vm.ErrCapacity) works.
+// Create admits a session for o and returns it as provisioning. The caller
+// never chooses the ID, image or size. Nothing is booted here: the row is
+// the reservation, and the reconciler creates the VM (ADR 0010, section 5).
 //
-// The slot is reserved before the provider is called, because that call can
-// take seconds: without the reservation, concurrent creates from one client
-// would all pass the check. The session is stored in the same critical
-// section that drops the reservation, so the VM is never counted twice or not
-// at all.
+// The Store's errors come back unchanged, so errors.As(*QuotaError) and
+// errors.Is(ErrCapacity) or errors.Is(ErrBusy) work for the caller.
 func (m *Manager) Create(ctx context.Context, o Owner) (vm.Instance, error) {
-	m.mu.Lock()
-	if err := m.checkQuota(o); err != nil {
-		m.mu.Unlock()
-		return vm.Instance{}, err
-	}
-	m.reserve(o)
-	m.mu.Unlock()
-
-	spec := vm.Spec{ID: m.newID(), Image: m.image, MemoryMB: m.memoryMB}
-	inst, err := m.provider.Create(ctx, spec)
-
-	now := m.now()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if err == nil {
-		m.sessions[inst.ID] = &session{owner: o.Hash, client: o.Client, created: now, idleSince: now}
-	}
-	m.unreserve(o)
+	s, err := m.store.Admit(ctx, NewSession{
+		OwnerID:     o.Hash,
+		ClientKey:   o.Client,
+		Profile:     defaultProfile,
+		ImageRef:    m.image,
+		Spec:        m.spec,
+		MaxDuration: m.max,
+		IdleTimeout: m.idle,
+	}, m.limits)
 	if err != nil {
 		return vm.Instance{}, err
 	}
-	return inst, nil
+	m.wake()
+	return toInstance(s), nil
 }
 
-// checkQuota counts live VMs and creates in flight against two limits: the
-// caller's own, on any network, and its Client's, across every owner on it.
-// VMs being deleted do not count: they are on their way out. When either
-// limit is hit and the caller holds a VM or a create of its own, the error
-// says so, with the oldest one's ID, so a double click finds the first VM.
-// The caller holds m.mu.
-func (m *Manager) checkQuota(o Owner) error {
-	ownerHeld, clientHeld := 0, 0
-	var oldestID string
-	var oldest time.Time
-	for id, s := range m.sessions {
-		if s.deleting {
-			continue
-		}
-		if s.client == o.Client {
-			clientHeld++
-		}
-		if !owns(s, o) {
-			continue
-		}
-		ownerHeld++
-		if oldestID == "" || s.created.Before(oldest) || (s.created.Equal(oldest) && id < oldestID) {
-			oldestID, oldest = id, s.created
-		}
-	}
-	for client, byOwner := range m.pending {
-		for hash, n := range byOwner {
-			if client == o.Client {
-				clientHeld += n
-			}
-			if o.Hash != "" && hash == o.Hash {
-				ownerHeld += n
-			}
-		}
-	}
-
-	if ownerHeld < m.perOwner && clientHeld < m.perClient {
-		return nil
-	}
-	if ownerHeld > 0 {
-		return &QuotaError{Yours: true, ID: oldestID}
-	}
-	return &QuotaError{}
-}
-
-// reserve and unreserve count o's creates in flight. Empty maps are removed so
-// the map does not grow with every client ever seen. The caller holds m.mu.
-func (m *Manager) reserve(o Owner) {
-	byOwner := m.pending[o.Client]
-	if byOwner == nil {
-		byOwner = make(map[string]int)
-		m.pending[o.Client] = byOwner
-	}
-	byOwner[o.Hash]++
-}
-
-func (m *Manager) unreserve(o Owner) {
-	byOwner := m.pending[o.Client]
-	if byOwner[o.Hash]--; byOwner[o.Hash] <= 0 {
-		delete(byOwner, o.Hash)
-	}
-	if len(byOwner) == 0 {
-		delete(m.pending, o.Client)
-	}
-}
-
-// owns compares in constant time. An empty hash owns nothing.
-func owns(s *session, o Owner) bool {
-	return o.Hash != "" && subtle.ConstantTimeCompare([]byte(s.owner), []byte(o.Hash)) == 1
-}
-
-// Get reports a VM that o created and the manager is not deleting. Any other
-// VM, whoever owns it, is ErrNotFound.
+// Get reports a session that o owns and has not asked to delete. Any other
+// session, whoever owns it, is ErrNotFound.
 func (m *Manager) Get(ctx context.Context, id string, o Owner) (vm.Instance, error) {
-	if !m.visible(id, o) {
-		return vm.Instance{}, notFound(id)
-	}
-	return m.provider.Get(ctx, id)
-}
-
-// Console attaches to a VM's console. The session counts as in use from before
-// the provider is asked, so Reap cannot delete it as idle in the gap between
-// the provider attaching and this method recording it.
-func (m *Manager) Console(ctx context.Context, id string, o Owner) (io.ReadWriteCloser, error) {
-	m.mu.Lock()
-	s, ok := m.sessions[id]
-	if !ok || s.deleting || !owns(s, o) {
-		m.mu.Unlock()
-		return nil, notFound(id)
-	}
-	s.attachers++
-	m.mu.Unlock()
-
-	c, err := m.provider.Console(ctx, id)
+	s, err := m.visible(ctx, id, o)
 	if err != nil {
-		m.release(id)
-		return nil, err
+		return vm.Instance{}, err
 	}
-	return &console{ReadWriteCloser: c, release: func() { m.release(id) }}, nil
+	return toInstance(s), nil
 }
 
-// Delete hides the VM at once and returns when it is really gone. If ctx ends
-// first the VM stays hidden and Reap finishes the deletion. Deleting a VM that
-// is already being deleted calls the provider again: it is idempotent, and a
-// retry after a failed attempt must do real work. A VM that is gone, or not
-// o's, is ErrNotFound.
+// Delete marks the session for deletion and returns at once; the reconciler
+// removes the VM. The session is hidden from that moment, so deleting it
+// again is ErrNotFound, as is a session that is missing or not o's.
 func (m *Manager) Delete(ctx context.Context, id string, o Owner) error {
-	m.mu.Lock()
-	s, ok := m.sessions[id]
-	if !ok || !owns(s, o) {
-		m.mu.Unlock()
-		return notFound(id)
-	}
-	s.deleting = true
-	m.mu.Unlock()
-
-	return m.finishDelete(ctx, id)
-}
-
-// finishDelete kills the VM and forgets the session.
-func (m *Manager) finishDelete(ctx context.Context, id string) error {
-	if err := m.provider.Delete(ctx, id); err != nil && !errors.Is(err, vm.ErrNotFound) {
+	s, err := m.visible(ctx, id, o)
+	if err != nil {
 		return err
 	}
-	m.forget(id)
+	// RequestDelete is idempotent, so two racing Deletes both succeed.
+	if err := m.store.RequestDelete(ctx, s.ID, o.Hash); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return notFound(id)
+		}
+		return fmt.Errorf("session: request delete: %w", err)
+	}
+	m.wake()
 	return nil
 }
 
-func (m *Manager) forget(id string) {
-	m.mu.Lock()
-	delete(m.sessions, id)
-	m.mu.Unlock()
+// Console attaches to the VM of a session o owns. The provider refuses a VM
+// that does not exist yet or is not running, and a second attach while it
+// can hold only one. Input written to the console counts as activity and
+// pushes the idle deadline out; attaching alone does not.
+//
+// TODO: the attach lease in the row (ADR 0010, section 7). It matters only
+// with several replicas, which the local provider does not support.
+func (m *Manager) Console(ctx context.Context, id string, o Owner) (io.ReadWriteCloser, error) {
+	s, err := m.visible(ctx, id, o)
+	if err != nil {
+		return nil, err
+	}
+	c, err := m.provider.Console(ctx, s.ID)
+	if err != nil {
+		return nil, err
+	}
+	return &activeConsole{ReadWriteCloser: c, m: m, id: s.ID}, nil
 }
 
-func (m *Manager) visible(id string, o Owner) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	s, ok := m.sessions[id]
-	return ok && !s.deleting && owns(s, o)
+// activeConsole records input as activity, throttled, without ever making a
+// keystroke wait for the database: the write happens in the background, one
+// at a time.
+type activeConsole struct {
+	io.ReadWriteCloser
+	m  *Manager
+	id string
+
+	mu       sync.Mutex
+	last     time.Time
+	inFlight bool
 }
 
-// release gives back one attach reservation. The idle clock restarts when the
-// last one goes.
-func (m *Manager) release(id string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (c *activeConsole) Write(p []byte) (int, error) {
+	c.touch()
+	return c.ReadWriteCloser.Write(p)
+}
 
-	s, ok := m.sessions[id]
-	if !ok || s.attachers == 0 {
+func (c *activeConsole) touch() {
+	c.mu.Lock()
+	now := c.m.now()
+	if c.inFlight || (!c.last.IsZero() && now.Sub(c.last) < activityThrottle) {
+		c.mu.Unlock()
 		return
 	}
-	s.attachers--
-	if s.attachers == 0 {
-		s.idleSince = m.now()
+	c.inFlight, c.last = true, now
+	c.mu.Unlock()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), touchTimeout)
+		defer cancel()
+		if err := c.m.store.TouchActivity(ctx, c.id, c.m.idle); err != nil {
+			c.m.log.Warn("record console activity failed", "session_id", c.id, "err", err)
+		}
+		c.mu.Lock()
+		c.inFlight = false
+		c.mu.Unlock()
+	}()
+}
+
+// visible returns the session if o owns it and it is not being deleted. The
+// Store returns sessions marked for deletion too; hiding them is this
+// layer's choice (ADR 0010, section 4).
+func (m *Manager) visible(ctx context.Context, id string, o Owner) (Session, error) {
+	s, err := m.store.Get(ctx, id, o.Hash)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return Session{}, notFound(id)
+	case err != nil:
+		return Session{}, fmt.Errorf("session: get: %w", err)
+	case s.DesiredDeleted || s.Status == StatusDeleting || s.Status == StatusDeleted:
+		return Session{}, notFound(id)
+	}
+	return s, nil
+}
+
+// toInstance is the session as the API shows it. Reason stays inside the
+// server: the HTTP layer does not send it.
+func toInstance(s Session) vm.Instance {
+	return vm.Instance{
+		ID:        s.ID,
+		Status:    s.Status.public(),
+		Image:     s.ImageRef,
+		Reason:    s.FailureReason,
+		CreatedAt: s.CreatedAt,
 	}
 }
 
-// console releases its reservation exactly once, however often it is closed.
-type console struct {
-	io.ReadWriteCloser
-	release func()
-	once    sync.Once
-}
-
-func (c *console) Close() error {
-	var err error
-	c.once.Do(func() {
-		err = c.ReadWriteCloser.Close()
-		c.release()
-	})
-	return err
-}
-
-// Reap runs one cleanup pass: it finishes deletions that were started but not
-// completed, drops sessions the provider no longer knows, and deletes VMs that
-// have finished, sat idle, or lived too long.
-func (m *Manager) Reap(ctx context.Context) {
-	type removal struct{ id, reason string }
-
-	// 1. Snapshot.
-	var pending []removal
-	var inspect []string
-	m.mu.Lock()
-	for id, s := range m.sessions {
-		if s.deleting {
-			pending = append(pending, removal{id, "retry"})
-		} else {
-			inspect = append(inspect, id)
-		}
-	}
-	m.mu.Unlock()
-
-	// 2. Ask the provider, with the lock released.
-	status := make(map[string]vm.Status, len(inspect))
-	for _, id := range inspect {
-		inst, err := m.provider.Get(ctx, id)
-		switch {
-		case errors.Is(err, vm.ErrNotFound):
-			m.forget(id)
-		case err != nil:
-			// Try again next pass.
-		default:
-			status[id] = inst.Status
-		}
-	}
-
-	// 3. Decide, re-reading each session: it may have changed meanwhile.
-	m.mu.Lock()
-	now := m.now()
-	for id, st := range status {
-		s, ok := m.sessions[id]
-		if !ok || s.deleting {
-			continue
-		}
-		if reason := m.dueReason(s, st, now); reason != "" {
-			s.deleting = true // hidden from now on
-			pending = append(pending, removal{id, reason})
-		}
-	}
-	m.mu.Unlock()
-
-	// 4. Delete, with the lock released.
-	for _, r := range pending {
-		if err := m.finishDelete(ctx, r.id); err != nil {
-			m.log.Error("session removal failed; will retry", "vm_id", r.id, "reason", r.reason, "err", err)
-			continue
-		}
-		m.log.Info("session removed", "vm_id", r.id, "reason", r.reason)
-	}
-}
-
-// dueReason says why a session should be deleted now, or "" if it should not.
-// The caller holds m.mu.
-func (m *Manager) dueReason(s *session, st vm.Status, now time.Time) string {
-	if st.IsTerminal() {
-		if s.terminalSince.IsZero() {
-			s.terminalSince = now
-		}
-		if now.Sub(s.terminalSince) >= m.grace {
-			return "finished"
-		}
-	}
-	if now.Sub(s.created) >= m.max {
-		return "max duration"
-	}
-	if s.attachers == 0 && now.Sub(s.idleSince) >= m.idle {
-		return "idle"
-	}
-	return ""
-}
-
-// Run calls Reap every interval until ctx ends.
-func (m *Manager) Run(ctx context.Context, interval time.Duration) {
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			m.Reap(ctx)
-		}
+// public maps a stored status to the one the API shows (ADR 0010, section
+// 4). DELETING and DELETED never get here: visible hides them. STOPPING is
+// not used until the product has a stopped state.
+func (s Status) public() vm.Status {
+	switch s {
+	case StatusCreated, StatusProvisioning:
+		return vm.StatusProvisioning
+	case StatusStarting:
+		return vm.StatusStarting
+	case StatusRunning:
+		return vm.StatusRunning
+	case StatusStopped:
+		return vm.StatusStopped
+	case StatusFailed:
+		return vm.StatusFailed
+	default:
+		return vm.StatusUnknown
 	}
 }
 

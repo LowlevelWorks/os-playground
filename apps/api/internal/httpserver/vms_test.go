@@ -18,8 +18,8 @@ import (
 	"github.com/os-playground-api/internal/vm/fake"
 )
 
-// api is the whole HTTP server over a real session manager and the fake
-// provider.
+// api is the whole HTTP server over a real session manager, an in-memory
+// store and the fake provider.
 type api struct {
 	t    *testing.T
 	fake *fake.Fake
@@ -34,8 +34,8 @@ var (
 	tokenB = strings.Repeat("B", tokenLen)
 )
 
-// newAPI allows each client more VMs than capacity, so tests that are not
-// about the quota never meet it. newQuotaAPI sets it.
+// newAPI allows each owner and client more sessions than capacity, so tests
+// that are not about the quota never meet it. newQuotaAPI sets it.
 func newAPI(t *testing.T, capacity int) *api {
 	t.Helper()
 	return newQuotaAPI(t, capacity, capacity+1)
@@ -43,11 +43,13 @@ func newAPI(t *testing.T, capacity int) *api {
 
 func newQuotaAPI(t *testing.T, capacity, perClient int) *api {
 	t.Helper()
-	f := fake.New(fake.WithAutoRun(), fake.WithCapacity(capacity))
+	f := fake.New(fake.WithAutoRun())
 	m, err := session.New(session.Config{
+		Store:        session.NewMemStore(time.Now),
 		Provider:     f,
 		Image:        "/secret/images/os.iso",
 		MemoryMB:     128,
+		Capacity:     capacity,
 		MaxPerOwner:  perClient,
 		MaxPerClient: perClient,
 		IdleTimeout:  time.Hour,
@@ -59,6 +61,15 @@ func newQuotaAPI(t *testing.T, capacity, perClient int) *api {
 	logs := &syncBuffer{}
 	srv := NewServer(m, []string{"http://localhost:3000"}, RateLimits{}, slog.New(slog.NewTextHandler(logs, nil)))
 	return &api{t: t, fake: f, srv: srv, logs: logs}
+}
+
+// boot does what the reconciler will: it creates the session's VM, so the
+// terminal has something to attach to.
+func (a *api) boot(id string) {
+	a.t.Helper()
+	if _, err := a.fake.Create(context.Background(), vm.Spec{ID: id, Image: "fake://os", MemoryMB: 128}); err != nil {
+		a.t.Fatalf("boot %s: %v", id, err)
+	}
 }
 
 // do sends a request as the owner of tokenA.
@@ -126,14 +137,18 @@ func TestCreateReturnsTheNewVM(t *testing.T) {
 	if loc := rec.Header().Get("Location"); loc != "/api/playgrounds/"+id {
 		t.Errorf("Location = %q, want /playgrounds/%s", loc, id)
 	}
+	// ADR 0010, section 5: stored, not booted.
+	if body["status"] != "provisioning" {
+		t.Errorf("status = %v, want provisioning", body["status"])
+	}
+	if a.fake.Len() != 0 {
+		t.Errorf("the provider holds %d VMs, want 0: POST must not call it", a.fake.Len())
+	}
 }
 
 func TestGetReturnsTheVMAndNothingAboutTheHost(t *testing.T) {
 	a := newAPI(t, 2)
 	id := decode(t, a.do("POST", "/api/playgrounds"))["id"].(string)
-	if err := a.fake.Finish(id, vm.StatusFailed, "open /secret/qemu/path: permission denied"); err != nil {
-		t.Fatal(err)
-	}
 
 	rec := a.do("GET", "/api/playgrounds/"+id)
 
@@ -142,8 +157,8 @@ func TestGetReturnsTheVMAndNothingAboutTheHost(t *testing.T) {
 	}
 	body := decode(t, rec)
 	wantKeys(t, body)
-	if body["id"] != id || body["status"] != "failed" {
-		t.Errorf("body = %v, want id %s and status failed", body, id)
+	if body["id"] != id || body["status"] != "provisioning" {
+		t.Errorf("body = %v, want id %s and status provisioning", body, id)
 	}
 	if strings.Contains(rec.Body.String(), "secret") {
 		t.Errorf("response leaks host details: %s", rec.Body)
@@ -181,8 +196,10 @@ func TestNoCapacityIs503WithRetryAfter(t *testing.T) {
 	}
 }
 
-func TestDeleteFreesTheSlotAndThenTheVMIsGone(t *testing.T) {
-	a := newAPI(t, 1)
+// DELETE frees the owner's quota at once. Capacity is freed only when the
+// reconciler has removed the VM, so this test leaves room for two.
+func TestDeleteFreesTheQuotaAndThenTheVMIsGone(t *testing.T) {
+	a := newQuotaAPI(t, 2, 1)
 	id := decode(t, a.do("POST", "/api/playgrounds"))["id"].(string)
 
 	if rec := a.do("DELETE", "/api/playgrounds/"+id); rec.Code != http.StatusNoContent || rec.Body.Len() != 0 {
@@ -195,7 +212,29 @@ func TestDeleteFreesTheSlotAndThenTheVMIsGone(t *testing.T) {
 		t.Errorf("GET after DELETE = %d, want 404", rec.Code)
 	}
 	if rec := a.do("POST", "/api/playgrounds"); rec.Code != http.StatusCreated {
-		t.Errorf("POST after DELETE = %d, want 201: the slot was not freed", rec.Code)
+		t.Errorf("POST after DELETE = %d, want 201: the quota was not freed", rec.Code)
+	}
+}
+
+// A busy admission lock is a 503 like no capacity, but must not read the
+// same: one means "full", the other "overloaded".
+func TestBusyIs503WithRetryAfterAndItsOwnMessage(t *testing.T) {
+	var logs syncBuffer
+	h := NewVMHandler(brokenVMs{session.ErrBusy}, slog.New(slog.NewTextHandler(&logs, nil)))
+	rec := httptest.NewRecorder()
+	h.Create(rec, httptest.NewRequest("POST", "/api/playgrounds", nil), session.Owner{Hash: hashToken(tokenA)})
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "5" {
+		t.Errorf("Retry-After = %q, want 5", got)
+	}
+	if got := decode(t, rec)["error"]; got != "server busy; try again shortly" {
+		t.Errorf("error = %v", got)
+	}
+	if !strings.Contains(logs.String(), "admission lock busy") {
+		t.Errorf("a busy refusal was not logged: %q", logs.String())
 	}
 }
 

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/os-playground-api/internal/vm"
 )
 
@@ -35,6 +37,14 @@ var (
 	// ErrInvalid means the request to the store was malformed. It is a bug in
 	// the caller, never the user's fault.
 	ErrInvalid = errors.New("session: invalid store request")
+
+	// ErrBusy means admission could not get the lock in time: the server is
+	// overloaded, not full. Map it to 503 with Retry-After.
+	ErrBusy = errors.New("session: busy, try again")
+
+	// ErrLeaseLost means another worker owns the session now: the outcome
+	// passed to Complete was discarded, and the caller must drop it too.
+	ErrLeaseLost = errors.New("session: work lease lost")
 )
 
 // Session is a stored session as the store returns it.
@@ -105,6 +115,70 @@ func (l Limits) validate() error {
 	return nil
 }
 
+// Claim is a session leased to one reconciler worker, with the columns the
+// reconciler needs that Session does not show.
+type Claim struct {
+	Session
+	Worker string
+
+	// VMReleased is vm_released_at IS NOT NULL: the VM is confirmed gone and
+	// the session no longer holds capacity.
+	VMReleased bool
+	// TerminatedAt is when the session reached STOPPED, FAILED or DELETED;
+	// zero until then.
+	TerminatedAt time.Time
+	// Attempts counts consecutive failed steps, for backoff.
+	Attempts int
+}
+
+// Result is the outcome of one reconcile step. Zero fields change nothing.
+type Result struct {
+	// Status is the new observed status; "" leaves it unchanged. Reaching
+	// RUNNING sets started_at, and STOPPED, FAILED or DELETED set
+	// terminated_at, each the first time only.
+	Status Status
+	// FailureReason is stored when not empty.
+	FailureReason string
+	// DesireDeleted is the reconciler's own decision to delete, on expiry.
+	DesireDeleted bool
+	// VMReleased records that the VM is confirmed gone, which frees its
+	// capacity slot. Status DELETED needs it, now or from an earlier step.
+	VMReleased bool
+	// Failed counts this step as a failed attempt; otherwise the count resets.
+	Failed bool
+	// RetryAfter is when the session is next due. A session marked for
+	// deletion is due at once whatever this says.
+	RetryAfter time.Duration
+}
+
+// validate rejects a Result the schema would refuse.
+func (r Result) validate(c Claim) error {
+	switch {
+	case r.Status != "" && !r.Status.valid():
+		return ErrInvalid
+	case r.Status == StatusDeleted && !r.VMReleased && !c.VMReleased:
+		return ErrInvalid
+	case r.RetryAfter < 0:
+		return ErrInvalid
+	}
+	return nil
+}
+
+func (s Status) valid() bool {
+	switch s {
+	case StatusCreated, StatusProvisioning, StatusStarting, StatusRunning,
+		StatusStopping, StatusStopped, StatusFailed, StatusDeleting, StatusDeleted:
+		return true
+	default:
+		return false
+	}
+}
+
+// terminal reports whether reaching s sets terminated_at.
+func (s Status) terminal() bool {
+	return s == StatusStopped || s == StatusFailed || s == StatusDeleted
+}
+
 // live reports whether a status counts toward quota while the desired state is
 // RUNNING. It must match the predicate on the sessions_live_by_* partial
 // indexes in the add_desired migration.
@@ -117,6 +191,29 @@ func (s Status) live() bool {
 	}
 }
 
+// canonicalID parses id and returns it in the canonical form the store hands
+// out. Callers turn a false into ErrNotFound: a malformed ID is an ID that
+// does not exist. Querying with the result, never the raw id, matters:
+// uuid.Parse also accepts "urn:uuid:…", which PostgreSQL rejects (22P02).
+func canonicalID(id string) (string, bool) {
+	u, err := uuid.Parse(id)
+	if err != nil {
+		return "", false
+	}
+	return u.String(), true
+}
+
+// checkAdmit is the input check every Store's Admit runs before any work.
+func checkAdmit(ctx context.Context, n NewSession, l Limits) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := n.validate(); err != nil {
+		return err
+	}
+	return l.validate()
+}
+
 // Store keeps sessions. PostgreSQL is the real one; MemStore is the reference
 // implementation for tests. Both must pass storetest.Run.
 type Store interface {
@@ -124,7 +221,8 @@ type Store interface {
 	// with respect to every other Admit. It checks the owner's quota first
 	// (so a double click gets *QuotaError with Yours and the ID), then
 	// capacity (ErrCapacity), then the client's quota (*QuotaError with
-	// ClientWide). Bad input gives ErrInvalid.
+	// ClientWide). Bad input gives ErrInvalid. A store that waits for a lock
+	// gives ErrBusy when it waits too long.
 	Admit(ctx context.Context, s NewSession, l Limits) (Session, error)
 
 	// Get returns the session if ownerID owns it, else ErrNotFound. Sessions
@@ -136,4 +234,18 @@ type Store interface {
 	// VM is gone. Idempotent. A session that is missing or owned by someone
 	// else gives ErrNotFound.
 	RequestDelete(ctx context.Context, id, ownerID string) error
+
+	// Claim leases up to limit due sessions to worker for lease, oldest due
+	// first. A session is due when it is not DELETED, its next attempt time
+	// has come, and no other lease on it is current. No lock is held after
+	// it returns: the provider work happens outside any transaction.
+	Claim(ctx context.Context, worker string, lease time.Duration, limit int) ([]Claim, error)
+
+	// Complete records a step's outcome and releases the lease. ErrLeaseLost
+	// means another worker holds the session now; nothing was written.
+	Complete(ctx context.Context, c Claim, r Result) error
+
+	// TouchActivity records console input: it pushes the idle deadline to at
+	// least now + idleFor. Callers throttle it. A missing ID is ErrNotFound.
+	TouchActivity(ctx context.Context, id string, idleFor time.Duration) error
 }

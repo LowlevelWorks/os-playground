@@ -12,6 +12,7 @@ import (
 	"errors"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -69,6 +70,24 @@ var cases = []struct {
 	{"CancelledContext", cancelledContext},
 	{"ConcurrentAdmitsRespectOwnerQuota", concurrentAdmitsRespectOwnerQuota},
 	{"ConcurrentAdmitsRespectCapacity", concurrentAdmitsRespectCapacity},
+	{"MalformedIDIsNotFound", malformedIDIsNotFound},
+	{"OtherIDSpellingsFindTheSession", otherIDSpellingsFindTheSession},
+
+	{"ClaimTakesDueSessionsOnce", claimTakesDueSessionsOnce},
+	{"ClaimHonoursLimitAndOrder", claimHonoursLimitAndOrder},
+	{"ClaimRejectsBadArguments", claimRejectsBadArguments},
+	{"CompleteRecordsTheOutcome", completeRecordsTheOutcome},
+	{"CompleteNeedsTheLease", completeNeedsTheLease},
+	{"ExpiredLeaseCanBeTakenOver", expiredLeaseCanBeTakenOver},
+	{"RetryAfterDefersTheSession", retryAfterDefersTheSession},
+	{"RequestDeleteMakesTheSessionDue", requestDeleteMakesTheSessionDue},
+	{"FailedAttemptsAreCounted", failedAttemptsAreCounted},
+	{"ReleasingTheVMFreesCapacity", releasingTheVMFreesCapacity},
+	{"DeletedNeedsAReleasedVM", deletedNeedsAReleasedVM},
+	{"CompleteRejectsAnUnknownStatus", completeRejectsAnUnknownStatus},
+	{"ReconcilerCanDesireDeletion", reconcilerCanDesireDeletion},
+	{"TouchActivityPushesTheIdleDeadline", touchActivityPushesTheIdleDeadline},
+	{"ConcurrentClaimsNeverShare", concurrentClaimsNeverShare},
 }
 
 func newSession(owner, client string) session.NewSession {
@@ -423,5 +442,37 @@ func concurrentAdmitsRespectCapacity(t *testing.T, st session.Store) {
 	}
 	if got := admitConcurrently(t, st, 50, l, distinct, isCapacity); got != l.Capacity {
 		t.Errorf("%d Admits succeeded, want exactly %d", got, l.Capacity)
+	}
+}
+
+// A malformed ID is an ID that does not exist, not a server error. The
+// urn:uuid: form parses as a UUID in Go but not in PostgreSQL, so a store
+// that passes the raw string to SQL fails here.
+func malformedIDIsNotFound(t *testing.T, st session.Store) {
+	mustAdmit(t, st, alice, home, roomy)
+	ctx := context.Background()
+	for _, id := range []string{"", "abc", "not-a-uuid", "'; DROP TABLE playground_sessions; --",
+		"00000000-0000-7000-8000-00000000000g", "urn:uuid:" + missingID} {
+		if _, err := st.Get(ctx, id, alice); !errors.Is(err, session.ErrNotFound) {
+			t.Errorf("Get(%q) = %v, want ErrNotFound", id, err)
+		}
+		if err := st.RequestDelete(ctx, id, alice); !errors.Is(err, session.ErrNotFound) {
+			t.Errorf("RequestDelete(%q) = %v, want ErrNotFound", id, err)
+		}
+	}
+}
+
+// Every spelling of a UUID names the same session, in every store.
+func otherIDSpellingsFindTheSession(t *testing.T, st session.Store) {
+	s := mustAdmit(t, st, alice, home, roomy)
+	ctx := context.Background()
+	for _, id := range []string{strings.ToUpper(s.ID), "{" + s.ID + "}", strings.ReplaceAll(s.ID, "-", "")} {
+		got, err := st.Get(ctx, id, alice)
+		if err != nil || got.ID != s.ID {
+			t.Errorf("Get(%q) = %q, %v; want %q", id, got.ID, err, s.ID)
+		}
+	}
+	if err := st.RequestDelete(ctx, strings.ToUpper(s.ID), alice); err != nil {
+		t.Errorf("RequestDelete(upper case) = %v, want nil", err)
 	}
 }

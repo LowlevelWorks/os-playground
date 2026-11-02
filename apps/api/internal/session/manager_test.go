@@ -2,13 +2,15 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	"io"
-	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/os-playground-api/internal/vm"
 	"github.com/os-playground-api/internal/vm/fake"
@@ -16,10 +18,9 @@ import (
 
 const (
 	testImage = "/images/os.iso"
+	testMemMB = 128
 	idle      = 15 * time.Minute
 	maxLife   = time.Hour
-	grace     = 30 * time.Second
-	timeout   = 5 * time.Second
 )
 
 // alice and bob share one address; carol is elsewhere. Hashes are opaque to
@@ -29,6 +30,9 @@ var (
 	bob   = Owner{Hash: "bbbb", Client: "203.0.113.1"}
 	carol = Owner{Hash: "cccc", Client: "198.51.100.7"}
 )
+
+// roomy is for tests that are not about limits, so they never meet one.
+var roomy = Limits{Capacity: 1000, PerOwner: 1000, PerClient: 1000}
 
 // clock is a hand-driven clock, so no test sleeps.
 type clock struct {
@@ -49,73 +53,58 @@ func (c *clock) Advance(d time.Duration) {
 }
 
 type rig struct {
-	t    *testing.T
-	fake *fake.Fake
-	clk  *clock
-	m    *Manager
+	t     *testing.T
+	fake  *fake.Fake
+	clk   *clock
+	store *MemStore
+	m     *Manager
 }
 
-// newRig builds a Manager over the fake provider with a fake clock and
-// sequential IDs (vm-1, vm-2, ...).
-func newRig(t *testing.T, opts ...fake.Option) *rig {
+// newRig builds a Manager over a MemStore and the fake provider, with a fake
+// clock.
+func newRig(t *testing.T, l Limits) *rig {
 	t.Helper()
-	return newRigOver(t, fake.New(append([]fake.Option{fake.WithAutoRun()}, opts...)...), nil)
-}
-
-func newRigOver(t *testing.T, f *fake.Fake, p vm.Provider) *rig {
-	t.Helper()
-	if p == nil {
-		p = f
-	}
+	clk := &clock{t: time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)}
+	store := NewMemStore(clk.Now)
+	f := fake.New(fake.WithAutoRun())
 	m, err := New(Config{
-		Provider:    p,
-		Image:       testImage,
-		MemoryMB:    128,
-		IdleTimeout: idle,
-		MaxDuration: maxLife,
-		Grace:       grace,
-		// Most tests are about lifecycles, not the quota; newQuotaRig sets it.
-		MaxPerOwner:  1000,
-		MaxPerClient: 1000,
+		Store:        store,
+		Provider:     f,
+		Image:        testImage,
+		MemoryMB:     testMemMB,
+		Capacity:     l.Capacity,
+		MaxPerOwner:  l.PerOwner,
+		MaxPerClient: l.PerClient,
+		IdleTimeout:  idle,
+		MaxDuration:  maxLife,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	clk := &clock{t: time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)}
-	m.now = clk.Now
-	n := 0
-	var mu sync.Mutex
-	m.newID = func() string {
-		mu.Lock()
-		defer mu.Unlock()
-		n++
-		return "vm-" + string(rune('0'+n%10)) + strings.Repeat("a", n/10)
-	}
-	return &rig{t: t, fake: f, clk: clk, m: m}
+	return &rig{t: t, fake: f, clk: clk, store: store, m: m}
 }
 
-func (r *rig) create() string {
+func (r *rig) createAs(o Owner) (string, error) {
 	r.t.Helper()
-	inst, err := r.m.Create(context.Background(), alice)
-	if err != nil {
-		r.t.Fatalf("Create: %v", err)
-	}
-	return inst.ID
+	inst, err := r.m.Create(context.Background(), o)
+	return inst.ID, err
 }
 
-func (r *rig) attach(id string) io.ReadWriteCloser {
+func (r *rig) mustCreateAs(o Owner) string {
 	r.t.Helper()
-	c, err := r.m.Console(context.Background(), id, alice)
+	id, err := r.createAs(o)
 	if err != nil {
-		r.t.Fatalf("Console(%s): %v", id, err)
+		r.t.Fatalf("Create as %s: %v", o.Hash, err)
 	}
-	return c
+	return id
 }
 
-// reapAfter moves the clock and runs one pass.
-func (r *rig) reapAfter(d time.Duration) {
-	r.clk.Advance(d)
-	r.m.Reap(context.Background())
+// boot does what the reconciler will: it creates the session's VM.
+func (r *rig) boot(id string) {
+	r.t.Helper()
+	if _, err := r.fake.Create(context.Background(), vm.Spec{ID: id, Image: testImage, MemoryMB: testMemMB}); err != nil {
+		r.t.Fatalf("boot %s: %v", id, err)
+	}
 }
 
 // vmExists asks the provider, not the manager.
@@ -124,366 +113,247 @@ func (r *rig) vmExists(id string) bool {
 	return err == nil
 }
 
-func (r *rig) tracked() int {
-	r.m.mu.Lock()
-	defer r.m.mu.Unlock()
-	return len(r.m.sessions)
+// failingStore returns the given errors and embeds a nil Store, so a call to
+// any other method panics: the test then shows it was not expected.
+type failingStore struct {
+	Store
+	admitErr, getErr error
 }
 
-func cancelled() context.Context {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	return ctx
+func (s failingStore) Admit(context.Context, NewSession, Limits) (Session, error) {
+	return Session{}, s.admitErr
 }
 
-func TestNewRejectsAConfigurationThatWouldDeleteEverything(t *testing.T) {
+func (s failingStore) Get(context.Context, string, string) (Session, error) {
+	return Session{}, s.getErr
+}
+
+func newOver(t *testing.T, s Store) *Manager {
+	t.Helper()
+	m, err := New(Config{
+		Store: s, Provider: fake.New(), Image: testImage, MemoryMB: testMemMB,
+		Capacity: 1, MaxPerOwner: 1, MaxPerClient: 1, IdleTimeout: idle, MaxDuration: maxLife,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return m
+}
+
+func TestNewReportsEveryInvalidField(t *testing.T) {
 	_, err := New(Config{})
 	if err == nil {
 		t.Fatal("New(Config{}) = nil, want errors")
 	}
-	for _, want := range []string{"Provider", "Image", "MemoryMB", "MaxPerOwner", "MaxPerClient", "IdleTimeout", "MaxDuration"} {
+	for _, want := range []string{"Store", "Provider", "Image", "MemoryMB", "Capacity", "MaxPerOwner", "MaxPerClient", "IdleTimeout", "MaxDuration"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error does not mention %s: %v", want, err)
 		}
 	}
 }
 
-func TestCreateChoosesTheSpecItself(t *testing.T) {
-	f := fake.New(fake.WithAutoRun())
-	m, err := New(Config{Provider: f, Image: testImage, MemoryMB: 128, IdleTimeout: idle, MaxDuration: maxLife, MaxPerOwner: 2, MaxPerClient: 2})
-	if err != nil {
-		t.Fatal(err)
-	}
+// ADR 0010, section 5: the row is committed and nothing else happens.
+func TestCreateIsInsertOnly(t *testing.T) {
+	r := newRig(t, roomy)
 
-	inst, err := m.Create(context.Background(), alice)
+	inst, err := r.m.Create(context.Background(), alice)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
-	if !regexp.MustCompile(`^vm-[0-9a-f]{20}$`).MatchString(inst.ID) {
-		t.Errorf("ID = %q, want vm- plus 20 hex digits", inst.ID)
+	if _, err := uuid.Parse(inst.ID); err != nil {
+		t.Errorf("ID = %q, want a UUID: %v", inst.ID, err)
 	}
-	if inst.Image != testImage {
-		t.Errorf("Image = %q, want the configured %q", inst.Image, testImage)
+	if inst.Status != vm.StatusProvisioning {
+		t.Errorf("Status = %q, want %q", inst.Status, vm.StatusProvisioning)
 	}
-	other, _ := m.Create(context.Background(), alice)
-	if other.ID == inst.ID {
-		t.Error("two VMs got the same ID")
+	if !inst.CreatedAt.Equal(r.clk.Now()) {
+		t.Errorf("CreatedAt = %v, want %v", inst.CreatedAt, r.clk.Now())
+	}
+	if r.fake.Len() != 0 {
+		t.Errorf("the provider holds %d VMs, want 0: Create must not call it", r.fake.Len())
+	}
+
+	other := r.mustCreateAs(alice)
+	if other == inst.ID {
+		t.Error("two sessions got the same ID")
 	}
 }
 
-func TestFailedCreateRegistersNothing(t *testing.T) {
-	r := newRig(t, fake.WithCapacity(1))
-	r.create()
+func TestCreateChoosesTheSpecItself(t *testing.T) {
+	r := newRig(t, roomy)
+	id := r.mustCreateAs(alice)
 
-	_, err := r.m.Create(context.Background(), alice)
-
-	if !errors.Is(err, vm.ErrCapacity) {
-		t.Fatalf("Create = %v, want ErrCapacity", err)
+	s, err := r.store.Get(context.Background(), id, alice.Hash)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
 	}
-	if got := r.tracked(); got != 1 {
-		t.Fatalf("%d sessions tracked, want 1", got)
+	if s.Status != StatusCreated || s.Profile != defaultProfile || s.ImageRef != testImage || s.ClientKey != alice.Client {
+		t.Errorf("stored %+v, want CREATED, profile %q, image %q, client %q", s, defaultProfile, testImage, alice.Client)
+	}
+	var spec vmSpec
+	if err := json.Unmarshal(s.Spec, &spec); err != nil || spec.MemoryMB != testMemMB {
+		t.Errorf("Spec = %s (%v), want memory_mb %d", s.Spec, err, testMemMB)
+	}
+	if got := s.ExpiresAt.Sub(s.CreatedAt); got != maxLife {
+		t.Errorf("ExpiresAt - CreatedAt = %v, want %v", got, maxLife)
+	}
+	if got := s.IdleExpiresAt.Sub(s.CreatedAt); got != idle {
+		t.Errorf("IdleExpiresAt - CreatedAt = %v, want %v", got, idle)
 	}
 }
 
-func TestOnlyVMsTheManagerCreatedAreVisible(t *testing.T) {
-	r := newRig(t)
-	// Created behind the manager's back.
-	if _, err := r.fake.Create(context.Background(), vm.Spec{ID: "stranger", Image: testImage, MemoryMB: 64}); err != nil {
-		t.Fatal(err)
+// The handler tells these errors apart, so the manager must not wrap or
+// replace them.
+func TestCreatePassesStoreErrorsThrough(t *testing.T) {
+	quota := &QuotaError{Yours: true, ID: "x"}
+	for _, want := range []error{ErrBusy, ErrCapacity, quota, ErrInvalid} {
+		_, err := newOver(t, failingStore{admitErr: want}).Create(context.Background(), alice)
+		if !errors.Is(err, want) {
+			t.Errorf("Create = %v, want %v", err, want)
+		}
 	}
 
-	if _, err := r.m.Get(context.Background(), "stranger", alice); !errors.Is(err, vm.ErrNotFound) {
-		t.Errorf("Get(stranger) = %v, want ErrNotFound", err)
-	}
-	if _, err := r.m.Console(context.Background(), "stranger", alice); !errors.Is(err, vm.ErrNotFound) {
-		t.Errorf("Console(stranger) = %v, want ErrNotFound", err)
-	}
-	if err := r.m.Delete(context.Background(), "stranger", alice); !errors.Is(err, vm.ErrNotFound) {
-		t.Errorf("Delete(stranger) = %v, want ErrNotFound", err)
-	}
-	if !r.vmExists("stranger") {
-		t.Error("the manager deleted a VM it did not create")
+	_, err := newOver(t, failingStore{admitErr: quota}).Create(context.Background(), alice)
+	var q *QuotaError
+	if !errors.As(err, &q) || q != quota {
+		t.Errorf("Create = %#v, want the store's *QuotaError itself", err)
 	}
 }
 
-func TestDeleteHidesTheVMAndFreesTheSlot(t *testing.T) {
-	r := newRig(t)
-	id := r.create()
+// A database fault must reach the handler as a fault (500), not as "not
+// found" (404), or an outage looks like every session vanished.
+func TestStoreFaultIsNotNotFound(t *testing.T) {
+	m := newOver(t, failingStore{getErr: errors.New("connection refused")})
+	ctx := context.Background()
 
-	if err := r.m.Delete(context.Background(), id, alice); err != nil {
+	_, getErr := m.Get(ctx, "id", alice)
+	_, consoleErr := m.Console(ctx, "id", alice)
+	deleteErr := m.Delete(ctx, "id", alice)
+	for name, err := range map[string]error{"Get": getErr, "Console": consoleErr, "Delete": deleteErr} {
+		if err == nil || errors.Is(err, vm.ErrNotFound) || !strings.Contains(err.Error(), "connection refused") {
+			t.Errorf("%s = %v, want the store's error, not ErrNotFound", name, err)
+		}
+	}
+}
+
+func TestPublicStatus(t *testing.T) {
+	tests := map[Status]vm.Status{
+		StatusCreated:      vm.StatusProvisioning,
+		StatusProvisioning: vm.StatusProvisioning,
+		StatusStarting:     vm.StatusStarting,
+		StatusRunning:      vm.StatusRunning,
+		StatusStopping:     vm.StatusUnknown,
+		StatusStopped:      vm.StatusStopped,
+		StatusFailed:       vm.StatusFailed,
+		Status("NEW"):      vm.StatusUnknown,
+	}
+	for in, want := range tests {
+		if got := in.public(); got != want {
+			t.Errorf("%s.public() = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// ADR 0010, section 4: a deleted session is invisible the moment it is
+// marked. Removing the VM is the reconciler's job, not Delete's.
+func TestDeleteHidesAtOnceAndLeavesTheVMToTheReconciler(t *testing.T) {
+	r := newRig(t, roomy)
+	id := r.mustCreateAs(alice)
+	r.boot(id)
+	ctx := context.Background()
+
+	if err := r.m.Delete(ctx, id, alice); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 
-	if _, err := r.m.Get(context.Background(), id, alice); !errors.Is(err, vm.ErrNotFound) {
+	if _, err := r.m.Get(ctx, id, alice); !errors.Is(err, vm.ErrNotFound) {
 		t.Errorf("Get after Delete = %v, want ErrNotFound", err)
 	}
-	if r.fake.Len() != 0 {
-		t.Error("the provider still holds the VM")
+	if _, err := r.m.Console(ctx, id, alice); !errors.Is(err, vm.ErrNotFound) {
+		t.Errorf("Console after Delete = %v, want ErrNotFound", err)
 	}
-	if err := r.m.Delete(context.Background(), id, alice); !errors.Is(err, vm.ErrNotFound) {
-		t.Errorf("second Delete = %v, want ErrNotFound: the VM is gone", err)
+	if err := r.m.Delete(ctx, id, alice); !errors.Is(err, vm.ErrNotFound) {
+		t.Errorf("second Delete = %v, want ErrNotFound", err)
+	}
+	if !r.vmExists(id) {
+		t.Error("Delete called the provider; only the reconciler may")
 	}
 }
 
-// A Delete whose caller gave up leaves the VM hidden. Asking again must do the
-// work, not return early because the VM is "already being deleted".
-func TestDeleteRetryAfterAFailedAttemptDoesTheWork(t *testing.T) {
-	r := newRig(t)
-	id := r.create()
-
-	if err := r.m.Delete(cancelled(), id, alice); err == nil {
-		t.Fatal("Delete with a cancelled context = nil, want its error")
-	}
-	if _, err := r.m.Get(context.Background(), id, alice); !errors.Is(err, vm.ErrNotFound) {
-		t.Fatalf("Get while deletion is pending = %v, want ErrNotFound", err)
-	}
-	if !r.vmExists(id) {
-		t.Fatal("setup: the VM should still exist after a cancelled Delete")
-	}
-
+// Quota is freed when Delete returns; capacity only when the VM is gone.
+func TestDeleteFreesQuotaButNotCapacity(t *testing.T) {
+	r := newRig(t, Limits{Capacity: 2, PerOwner: 1, PerClient: 1})
+	id := r.mustCreateAs(alice)
 	if err := r.m.Delete(context.Background(), id, alice); err != nil {
-		t.Fatalf("retried Delete: %v", err)
-	}
-	if r.vmExists(id) {
-		t.Fatal("the retried Delete returned nil but the VM is still alive")
-	}
-}
-
-func TestReapFinishesAnAbandonedDelete(t *testing.T) {
-	r := newRig(t)
-	id := r.create()
-	if err := r.m.Delete(cancelled(), id, alice); !errors.Is(err, context.Canceled) {
-		t.Fatalf("setup: Delete with a cancelled ctx = %v, want context.Canceled", err)
-	}
-
-	r.m.Reap(context.Background())
-
-	if r.vmExists(id) || r.tracked() != 0 {
-		t.Fatalf("after Reap: vm exists=%v, tracked=%d; want neither", r.vmExists(id), r.tracked())
-	}
-}
-
-func TestFinishedVMStaysReadableForTheGracePeriod(t *testing.T) {
-	r := newRig(t)
-	id := r.create()
-	if err := r.fake.Finish(id, vm.StatusFailed, "boom"); err != nil {
 		t.Fatal(err)
 	}
 
-	r.reapAfter(0) // first seen finished
-	r.reapAfter(grace - time.Second)
-	got, err := r.m.Get(context.Background(), id, alice)
-	if err != nil || got.Status != vm.StatusFailed {
-		t.Fatalf("inside the grace period: %+v, %v; want the failed VM still readable", got, err)
-	}
-
-	r.reapAfter(time.Second)
-	if r.vmExists(id) {
-		t.Fatal("the finished VM survived past the grace period")
-	}
-	if _, err := r.m.Get(context.Background(), id, alice); !errors.Is(err, vm.ErrNotFound) {
-		t.Fatalf("Get after removal = %v, want ErrNotFound", err)
+	r.mustCreateAs(alice)
+	if _, err := r.createAs(carol); !errors.Is(err, vm.ErrCapacity) {
+		t.Fatalf("Create = %v, want ErrCapacity: the deleted session's VM is not released yet", err)
 	}
 }
 
-func TestNeverUsedVMIsRemovedWhenIdle(t *testing.T) {
-	r := newRig(t)
-	id := r.create()
+func TestConsoleReachesTheVMOnceItExists(t *testing.T) {
+	r := newRig(t, roomy)
+	id := r.mustCreateAs(alice)
+	ctx := context.Background()
 
-	r.reapAfter(idle - time.Second)
-	if !r.vmExists(id) {
-		t.Fatal("removed before the idle timeout")
-	}
-	r.reapAfter(time.Second)
-	if r.vmExists(id) {
-		t.Fatal("still alive at the idle timeout")
-	}
-}
-
-func TestIdleClockRestartsWhenTheBrowserLeaves(t *testing.T) {
-	r := newRig(t)
-	id := r.create()
-	r.reapAfter(10 * time.Minute)
-	c := r.attach(id)
-
-	r.reapAfter(30 * time.Minute) // t=40m: far past the idle timeout, but attached
-	if !r.vmExists(id) {
-		t.Fatal("an attached VM was removed as idle")
+	if _, err := r.m.Console(ctx, id, alice); !errors.Is(err, vm.ErrNotFound) {
+		t.Fatalf("Console before the VM exists = %v, want the provider's ErrNotFound", err)
 	}
 
-	c.Close() // idle clock restarts at t=40m
-	r.reapAfter(idle - time.Second)
-	if !r.vmExists(id) {
-		t.Fatal("removed before the idle timeout counted from the disconnect")
+	r.boot(id)
+	c, err := r.m.Console(ctx, id, alice)
+	if err != nil {
+		t.Fatalf("Console: %v", err)
 	}
-	r.reapAfter(time.Second)
-	if r.vmExists(id) {
-		t.Fatal("still alive after the idle timeout counted from the disconnect")
+	if err := c.Close(); err != nil {
+		t.Errorf("Close: %v", err)
 	}
 }
 
-func TestMaxDurationEndsEvenAnAttachedVM(t *testing.T) {
-	r := newRig(t)
-	id := r.create()
-	r.attach(id)
+// Another spelling of the same UUID must reach the same VM: the provider
+// is asked by the stored ID, never by the caller's string.
+func TestConsoleUsesTheStoredID(t *testing.T) {
+	r := newRig(t, roomy)
+	id := r.mustCreateAs(alice)
+	r.boot(id)
 
-	r.reapAfter(maxLife)
-
-	if r.vmExists(id) {
-		t.Fatal("an attached VM outlived the maximum duration")
+	c, err := r.m.Console(context.Background(), strings.ToUpper(id), alice)
+	if err != nil {
+		t.Fatalf("Console with an upper-case ID: %v", err)
 	}
+	c.Close()
 }
 
-func TestFailedSecondAttachDoesNotMarkTheVMIdle(t *testing.T) {
-	r := newRig(t)
-	id := r.create()
-	r.attach(id)
-
-	if _, err := r.m.Console(context.Background(), id, alice); !errors.Is(err, vm.ErrAlreadyAttached) {
-		t.Fatalf("second Console = %v, want ErrAlreadyAttached", err)
-	}
-
-	r.reapAfter(idle + time.Minute)
-	if !r.vmExists(id) {
-		t.Fatal("the failed second attach cleared the first browser's in-use mark")
-	}
-}
-
-func TestClosingAConsoleTwiceCountsOnce(t *testing.T) {
-	r := newRig(t)
-	id := r.create()
-	first := r.attach(id)
-	first.Close()
-	second := r.attach(id)
-	defer second.Close()
-
-	first.Close() // must not release the second browser's reservation
-
-	r.reapAfter(idle + time.Minute)
-	if !r.vmExists(id) {
-		t.Fatal("a repeated Close released someone else's attachment")
-	}
-}
-
-func TestReapForgetsSessionsTheProviderLost(t *testing.T) {
-	r := newRig(t)
-	id := r.create()
-	if err := r.fake.Delete(context.Background(), id); err != nil { // gone behind the manager's back
-		t.Fatal(err)
-	}
-
-	r.m.Reap(context.Background())
-
-	if got := r.tracked(); got != 0 {
-		t.Fatalf("%d sessions still tracked, want 0", got)
-	}
-}
-
-// gated pauses Console after the provider has been asked, so a test can run
-// Reap in the gap the reservation is meant to protect.
-type gated struct {
-	vm.Provider
-	entered chan struct{}
-	proceed chan struct{}
-}
-
-func (g *gated) Console(ctx context.Context, id string) (io.ReadWriteCloser, error) {
-	g.entered <- struct{}{}
-	<-g.proceed
-	return g.Provider.Console(ctx, id)
-}
-
-func TestReapCannotRemoveAVMWhoseAttachIsInFlight(t *testing.T) {
-	f := fake.New(fake.WithAutoRun())
-	g := &gated{Provider: f, entered: make(chan struct{}, 1), proceed: make(chan struct{})}
-	r := newRigOver(t, f, g)
-	id := r.create()
-
-	type result struct {
-		c   io.ReadWriteCloser
-		err error
-	}
-	done := make(chan result, 1)
-	go func() {
-		c, err := r.m.Console(context.Background(), id, alice)
-		done <- result{c, err}
-	}()
-	<-g.entered // the provider is being asked; the session is not yet marked attached by the provider
-
-	r.reapAfter(idle + time.Minute) // idle by the clock, but an attach is in flight
-	if !r.vmExists(id) {
-		t.Fatal("Reap removed the VM while an attach was in flight")
-	}
-
-	close(g.proceed)
-	select {
-	case res := <-done:
-		if res.err != nil {
-			t.Fatalf("Console: %v", res.err)
-		}
-		res.c.Close()
-	case <-time.After(timeout):
-		t.Fatal("Console did not return")
-	}
-}
-
+// Meant for -race: only deadlocks and races fail this.
 func TestConcurrentUse(t *testing.T) {
-	r := newRig(t)
-	r.m.now = time.Now // real clock: this test is about races, not timing
+	r := newRig(t, roomy)
 
 	var wg sync.WaitGroup
-	for w := 0; w < 8; w++ {
+	for w := range 8 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := 0; i < 20; i++ {
-				inst, err := r.m.Create(context.Background(), alice)
+			o := Owner{Hash: "owner" + strconv.Itoa(w), Client: alice.Client}
+			ctx := context.Background()
+			for range 20 {
+				inst, err := r.m.Create(ctx, o)
 				if err != nil {
-					continue
+					t.Errorf("Create: %v", err)
+					return
 				}
-				if c, err := r.m.Console(context.Background(), inst.ID, alice); err == nil {
+				_, _ = r.m.Get(ctx, inst.ID, o)
+				if c, err := r.m.Console(ctx, inst.ID, o); err == nil {
 					c.Close()
 				}
-				// Results are ignored on purpose: only deadlocks and races fail this.
-				_, _ = r.m.Get(context.Background(), inst.ID, alice)
-				r.m.Reap(context.Background())
-				_ = r.m.Delete(context.Background(), inst.ID, alice)
+				if err := r.m.Delete(ctx, inst.ID, o); err != nil {
+					t.Errorf("Delete: %v", err)
+				}
 			}
 		}()
 	}
 	wg.Wait()
-
-	r.m.Reap(context.Background())
-	if r.fake.Len() != 0 || r.tracked() != 0 {
-		t.Fatalf("leftovers: provider %d, tracked %d", r.fake.Len(), r.tracked())
-	}
-}
-
-func TestRunReapsOnATickAndStopsWithItsContext(t *testing.T) {
-	r := newRig(t)
-	id := r.create()
-	r.clk.Advance(idle + time.Minute)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	stopped := make(chan struct{})
-	go func() {
-		r.m.Run(ctx, 5*time.Millisecond)
-		close(stopped)
-	}()
-
-	deadline := time.Now().Add(timeout)
-	for r.vmExists(id) {
-		if time.Now().After(deadline) {
-			t.Fatal("Run never removed the idle VM")
-		}
-		time.Sleep(time.Millisecond)
-	}
-
-	cancel()
-	select {
-	case <-stopped:
-	case <-time.After(timeout):
-		t.Fatal("Run did not stop when its context ended")
-	}
 }
