@@ -101,6 +101,9 @@ var cases = []struct {
 	{"RenewNeedsTheLease", renewNeedsTheLease},
 	{"ConcurrentAcquiresHaveOneWinner", concurrentAcquiresHaveOneWinner},
 	{"HoldingVMListsUnreleasedSessions", holdingVMListsUnreleasedSessions},
+
+	{"PurgeRemovesOnlyOldDeletedSessions", purgeRemovesOnlyOldDeletedSessions},
+	{"PurgeHonoursTheLimit", purgeHonoursTheLimit},
 }
 
 func newSession(owner, client string) session.NewSession {

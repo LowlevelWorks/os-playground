@@ -64,6 +64,13 @@ func admitIsAudited(t *testing.T, st session.Store) {
 	if e.Metadata["profile"] != "small" || e.Metadata["image_ref"] != "alpine:3.20" {
 		t.Errorf("metadata = %v, want the profile and image", e.Metadata)
 	}
+	// Privacy (ADR 0010, section 12): audit rows outlive sessions by months,
+	// so they never hold the client's network address.
+	for k, v := range e.Metadata {
+		if v == home {
+			t.Errorf("metadata[%q] holds the client address", k)
+		}
+	}
 }
 
 func requestDeleteIsAuditedOnce(t *testing.T, st session.Store) {

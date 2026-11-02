@@ -326,6 +326,54 @@ func (m *MemStore) TouchActivity(ctx context.Context, id string, idleFor time.Du
 	return nil
 }
 
+// PurgeDeletedSessions implements Store.PurgeDeletedSessions.
+func (m *MemStore) PurgeDeletedSessions(ctx context.Context, olderThan time.Duration, limit int) (int, error) {
+	if err := checkPurge(ctx, olderThan, limit); err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cutoff := m.now().UTC().Add(-olderThan)
+	var due []*row
+	for _, r := range m.rows {
+		if r.s.Status == StatusDeleted && !r.terminatedAt.IsZero() && r.terminatedAt.Before(cutoff) {
+			due = append(due, r)
+		}
+	}
+	slices.SortFunc(due, func(a, b *row) int { return a.terminatedAt.Compare(b.terminatedAt) })
+	if len(due) > limit {
+		due = due[:limit]
+	}
+	for _, r := range due {
+		delete(m.rows, r.s.ID)
+	}
+	return len(due), nil
+}
+
+// PurgeAuditEvents implements AuditPurger.
+func (m *MemStore) PurgeAuditEvents(ctx context.Context, olderThan time.Duration, limit int) (int, error) {
+	if err := checkPurge(ctx, olderThan, limit); err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cutoff := m.now().UTC().Add(-olderThan)
+	kept := m.audit[:0]
+	n := 0
+	for _, e := range m.audit { // oldest first: m.audit is in insertion order
+		if n < limit && e.OccurredAt.Before(cutoff) {
+			n++
+			continue
+		}
+		kept = append(kept, e)
+	}
+	clear(m.audit[len(kept):])
+	m.audit = kept
+	return n, nil
+}
+
 // HoldingVM implements Store.HoldingVM.
 func (m *MemStore) HoldingVM(ctx context.Context, ids []string) (map[string]bool, error) {
 	if err := ctx.Err(); err != nil {

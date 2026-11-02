@@ -278,4 +278,32 @@ type Store interface {
 	// ReleaseAttach gives holder's lease up. It is idempotent: releasing a
 	// lease holder does not have is nil.
 	ReleaseAttach(ctx context.Context, id, holder string) error
+
+	// PurgeDeletedSessions hard-deletes up to limit DELETED sessions that
+	// ended more than olderThan ago, oldest first, and returns how many. Only
+	// DELETED rows go: their VM is released, so the orphan sweep cannot
+	// mistake a live VM for an orphan. Audit events refer to sessions by ID
+	// with no foreign key, so they are unaffected. ErrBusy means another
+	// replica is purging right now.
+	PurgeDeletedSessions(ctx context.Context, olderThan time.Duration, limit int) (int, error)
+}
+
+// AuditPurger deletes old audit events. It is separate from Store because in
+// PostgreSQL it needs the playground_retention role, which the API's own
+// connection must not have.
+type AuditPurger interface {
+	// PurgeAuditEvents deletes up to limit events that occurred more than
+	// olderThan ago, oldest first, and returns how many. ErrBusy means
+	// another replica is purging right now.
+	PurgeAuditEvents(ctx context.Context, olderThan time.Duration, limit int) (int, error)
+}
+
+func checkPurge(ctx context.Context, olderThan time.Duration, limit int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if olderThan <= 0 || limit < 1 {
+		return ErrInvalid
+	}
+	return nil
 }

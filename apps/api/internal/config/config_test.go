@@ -359,3 +359,46 @@ func TestDatabaseSettings(t *testing.T) {
 		}
 	}
 }
+
+func TestRetentionSettings(t *testing.T) {
+	cfg, err := Load(env(nil))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.SessionRetention != 720*time.Hour || cfg.AuditRetention != 2160*time.Hour || cfg.RetentionDatabaseURL != "" {
+		t.Errorf("defaults = %v, %v, %q; want 720h, 2160h and no retention URL",
+			cfg.SessionRetention, cfg.AuditRetention, cfg.RetentionDatabaseURL)
+	}
+
+	cfg, err = Load(env(map[string]string{
+		EnvSessionRetention:     "24h",
+		EnvAuditRetention:       "8760h",
+		EnvRetentionDatabaseURL: "postgres://retention:s3cret@db/playground",
+	}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.SessionRetention != 24*time.Hour || cfg.AuditRetention != 8760*time.Hour ||
+		cfg.RetentionDatabaseURL.Reveal() != "postgres://retention:s3cret@db/playground" {
+		t.Errorf("got %v, %v, %q", cfg.SessionRetention, cfg.AuditRetention, cfg.RetentionDatabaseURL.Reveal())
+	}
+	var logs strings.Builder
+	slog.New(slog.NewTextHandler(&logs, nil)).Info("x", "config", cfg)
+	if strings.Contains(logs.String(), "s3cret") || strings.Contains(fmt.Sprintf("%+v", cfg), "s3cret") {
+		t.Errorf("the retention URL's password is shown: %s", logs.String())
+	}
+
+	for _, bad := range []map[string]string{
+		{EnvSessionRetention: "0s"},
+		{EnvAuditRetention: "30d"}, // Go durations have no days
+		{EnvAuditRetention: "100000h"},
+		{EnvRetentionDatabaseURL: "mysql://u:hunter2@h/db"},
+	} {
+		_, err := Load(env(bad))
+		if err == nil {
+			t.Errorf("Load(%v) = nil, want an error", bad)
+		} else if strings.Contains(err.Error(), "hunter2") {
+			t.Errorf("error leaks the password: %v", err)
+		}
+	}
+}
