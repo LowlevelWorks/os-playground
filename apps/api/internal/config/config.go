@@ -43,6 +43,12 @@ const (
 	EnvSessionRetention     = "PLAYGROUND_SESSION_RETENTION"
 	EnvAuditRetention       = "PLAYGROUND_AUDIT_RETENTION"
 	EnvRetentionDatabaseURL = "PLAYGROUND_RETENTION_DATABASE_URL"
+
+	EnvPublicURL        = "PLAYGROUND_PUBLIC_URL"
+	EnvOIDCIssuer       = "PLAYGROUND_OIDC_ISSUER"
+	EnvOIDCClientID     = "PLAYGROUND_OIDC_CLIENT_ID"
+	EnvOIDCClientSecret = "PLAYGROUND_OIDC_CLIENT_SECRET"
+	EnvLoginSessionTTL  = "PLAYGROUND_LOGIN_SESSION_TTL"
 )
 
 const (
@@ -78,6 +84,10 @@ const (
 	defaultSessionRetention = 30 * 24 * time.Hour
 	defaultAuditRetention   = 90 * 24 * time.Hour
 	maxRetention            = 10 * 365 * 24 * time.Hour
+
+	defaultOIDCIssuer      = "https://accounts.google.com"
+	defaultLoginSessionTTL = 7 * 24 * time.Hour
+	maxLoginSessionTTL     = 30 * 24 * time.Hour
 
 	maxVMMemoryMB = 4096
 	maxDBMaxConns = 1000
@@ -119,6 +129,16 @@ type Config struct {
 	// only role that may delete audit events. Empty means audit events are
 	// kept forever. A Secret, like DatabaseURL.
 	RetentionDatabaseURL Secret
+
+	// Sign-in with OpenID Connect (Google by default). With no client ID,
+	// sign-in is off and nobody can start a machine. PublicURL is the API's
+	// origin as browsers reach it; the provider redirects to it, so register
+	// PublicURL + "/api/v1/auth/callback" with the provider.
+	PublicURL        string
+	OIDCIssuer       string
+	OIDCClientID     string
+	OIDCClientSecret Secret
+	LoginSessionTTL  time.Duration
 
 	ImagePath  string
 	QEMUBin    string
@@ -195,12 +215,18 @@ func Load(lookup Lookup) (Config, error) {
 
 		SessionRetention: l.duration(EnvSessionRetention, defaultSessionRetention, maxRetention),
 		AuditRetention:   l.duration(EnvAuditRetention, defaultAuditRetention, maxRetention),
+
+		OIDCIssuer:       l.str(EnvOIDCIssuer, defaultOIDCIssuer),
+		OIDCClientID:     l.str(EnvOIDCClientID, ""),
+		OIDCClientSecret: Secret(l.str(EnvOIDCClientSecret, "")),
+		LoginSessionTTL:  l.duration(EnvLoginSessionTTL, defaultLoginSessionTTL, maxLoginSessionTTL),
 	}
 
 	l.listenAddrs(&cfg)
 	cfg.AllowedOrigins = l.origins()
 	cfg.DatabaseURL = l.databaseURL()
 	cfg.RetentionDatabaseURL = l.optionalDatabaseURL(EnvRetentionDatabaseURL)
+	l.signIn(&cfg)
 	l.relations(cfg)
 
 	if len(l.errs) > 0 {
@@ -245,6 +271,46 @@ func (l *loader) databaseURL() Secret {
 		return ""
 	}
 	return Secret(raw)
+}
+
+// SignInEnabled reports whether OIDC sign-in is configured.
+func (c Config) SignInEnabled() bool { return c.OIDCClientID != "" }
+
+// signIn checks the OIDC settings, which only matter together.
+func (l *loader) signIn(cfg *Config) {
+	cfg.PublicURL = strings.TrimSuffix(l.str(EnvPublicURL, ""), "/")
+	if (cfg.OIDCClientID == "") != (cfg.OIDCClientSecret == "") {
+		l.fail(EnvOIDCClientSecret, "", "must be set exactly when "+EnvOIDCClientID+" is")
+		return
+	}
+	if !cfg.SignInEnabled() {
+		return
+	}
+	if u, err := url.Parse(cfg.OIDCIssuer); err != nil || u.Scheme != "https" || u.Host == "" {
+		l.fail(EnvOIDCIssuer, cfg.OIDCIssuer, "must be an https URL")
+	}
+	if cfg.PublicURL == "" {
+		l.fail(EnvPublicURL, "", "is required when "+EnvOIDCClientID+" is set")
+		return
+	}
+	u, err := url.Parse(cfg.PublicURL)
+	switch {
+	case err != nil || u.Host == "" || u.Path != "" || u.RawQuery != "" || u.User != nil:
+		l.fail(EnvPublicURL, cfg.PublicURL, "must be an origin such as https://play.example.com")
+	case u.Scheme == "https":
+	case u.Scheme == "http" && isLoopback(u.Hostname()):
+		// Local development: browsers treat localhost as secure enough.
+	default:
+		l.fail(EnvPublicURL, cfg.PublicURL, "must be https, except for localhost: the login cookie must never cross a network in clear")
+	}
+}
+
+func isLoopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // optionalDatabaseURL is like databaseURL for a setting that may be empty.
@@ -330,6 +396,10 @@ func (c Config) LogValue() slog.Value {
 		slog.Duration("session_retention", c.SessionRetention),
 		slog.Duration("audit_retention", c.AuditRetention),
 		slog.Any("retention_database", c.RetentionDatabaseURL),
+		slog.String("public_url", c.PublicURL),
+		slog.String("oidc_issuer", c.OIDCIssuer),
+		slog.String("oidc_client_id", c.OIDCClientID),
+		slog.Duration("login_session_ttl", c.LoginSessionTTL),
 		slog.String("image", c.ImagePath),
 		slog.String("qemu", c.QEMUBin),
 		slog.String("qemu_accel", c.QEMUAccel),

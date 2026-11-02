@@ -169,3 +169,17 @@ body {
   border: 0;
 }
 
+
+.account {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin-bottom: 12px;
+  color: var(--ink-soft);
+  font-size: 0.95rem;
+}
+.account strong { color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
+.btn.small { padding: 5px 12px; font-size: 0.9rem; }
+a.btn { display: inline-block; text-decoration: none; }

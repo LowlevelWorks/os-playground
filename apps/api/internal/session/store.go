@@ -57,8 +57,8 @@ var (
 type Session struct {
 	ID string
 
-	// OwnerID is opaque: the anonymous owner token hash until OIDC lands, then
-	// the user ID.
+	// OwnerID is the owning user's id (users.id). The store treats it as
+	// opaque text.
 	OwnerID string
 
 	// ClientKey identifies the network the session was created from.

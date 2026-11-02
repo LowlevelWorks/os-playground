@@ -93,7 +93,7 @@ func TestCreatingVMsHasItsOwnStricterLimit(t *testing.T) {
 	h := rateLimit(RateLimits{RequestsPerSecond: 100, Burst: 100, CreatesPerMinute: 2}, a.srv)
 	do := func(method, path string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, path, nil)
-		req.Header.Set("Authorization", "Bearer "+tokenA)
+		withSession(req, tokenA)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		return rec

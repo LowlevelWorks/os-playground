@@ -25,10 +25,28 @@ type RetentionConfig struct {
 	Audit          AuditPurger
 	AuditRetention time.Duration // required when Audit is set
 
+	// LoginSessions, if set, has its expired login sessions deleted too.
+	LoginSessions LoginSessionPurger
+
 	Interval time.Duration // how often to purge; zero is daily
 	Batch    int           // rows per transaction; zero is 1000
 	Logger   *slog.Logger  // nil discards
 }
+
+// LoginSessionPurger deletes expired login sessions. *auth.PGStore
+// implements it.
+type LoginSessionPurger interface {
+	PurgeExpired(ctx context.Context, limit int) (int, error)
+}
+
+// Purged counts what one PurgeOnce removed.
+type Purged struct {
+	Sessions      int
+	AuditEvents   int
+	LoginSessions int
+}
+
+func (p Purged) any() bool { return p.Sessions > 0 || p.AuditEvents > 0 || p.LoginSessions > 0 }
 
 // Retention deletes DELETED sessions and audit events once they are older
 // than their retention periods (ADR 0010, section 12). It works in small
@@ -39,6 +57,7 @@ type Retention struct {
 	sessionKeep time.Duration
 	audit       AuditPurger
 	auditKeep   time.Duration
+	logins      LoginSessionPurger
 	interval    time.Duration
 	batch       int
 	log         *slog.Logger
@@ -70,6 +89,7 @@ func NewRetention(cfg RetentionConfig) (*Retention, error) {
 		sessionKeep: cfg.SessionRetention,
 		audit:       cfg.Audit,
 		auditKeep:   cfg.AuditRetention,
+		logins:      cfg.LoginSessions,
 		interval:    cmp.Or(cfg.Interval, defaultPurgeInterval),
 		batch:       cmp.Or(cfg.Batch, defaultPurgeBatch),
 		log:         cfg.Logger,
@@ -81,12 +101,14 @@ func (r *Retention) Run(ctx context.Context) {
 	t := time.NewTicker(r.interval)
 	defer t.Stop()
 	for {
-		sessions, events, err := r.PurgeOnce(ctx)
+		p, err := r.PurgeOnce(ctx)
 		switch {
 		case err != nil && ctx.Err() == nil:
-			r.log.Error("retention purge failed", "sessions", sessions, "audit_events", events, "err", err)
-		case sessions > 0 || events > 0:
-			r.log.Info("retention purge", "sessions", sessions, "audit_events", events)
+			r.log.Error("retention purge failed", "sessions", p.Sessions, "audit_events", p.AuditEvents,
+				"login_sessions", p.LoginSessions, "err", err)
+		case p.any():
+			r.log.Info("retention purge", "sessions", p.Sessions, "audit_events", p.AuditEvents,
+				"login_sessions", p.LoginSessions)
 		}
 		select {
 		case <-ctx.Done():
@@ -96,20 +118,30 @@ func (r *Retention) Run(ctx context.Context) {
 	}
 }
 
-// PurgeOnce runs both purges to completion and returns how many rows each
+// PurgeOnce runs every purge to completion and returns how many rows each
 // removed. A purge another replica is running is skipped, not an error.
-func (r *Retention) PurgeOnce(ctx context.Context) (sessions, events int, err error) {
-	sessions, serr := r.drain(ctx, func(ctx context.Context) (int, error) {
+func (r *Retention) PurgeOnce(ctx context.Context) (Purged, error) {
+	var p Purged
+	var errs []error
+	n, err := r.drain(ctx, func(ctx context.Context) (int, error) {
 		return r.sessions.PurgeDeletedSessions(ctx, r.sessionKeep, r.batch)
 	})
+	p.Sessions, errs = n, append(errs, err)
 	if r.audit != nil {
-		var aerr error
-		events, aerr = r.drain(ctx, func(ctx context.Context) (int, error) {
+		n, err := r.drain(ctx, func(ctx context.Context) (int, error) {
 			return r.audit.PurgeAuditEvents(ctx, r.auditKeep, r.batch)
 		})
-		serr = errors.Join(serr, aerr)
+		p.AuditEvents, errs = n, append(errs, err)
 	}
-	return sessions, events, serr
+	if r.logins != nil {
+		// Expired login sessions authenticate nothing, so any replica may
+		// delete them at any time; no lock is needed.
+		n, err := r.drain(ctx, func(ctx context.Context) (int, error) {
+			return r.logins.PurgeExpired(ctx, r.batch)
+		})
+		p.LoginSessions, errs = n, append(errs, err)
+	}
+	return p, errors.Join(errs...)
 }
 
 // drain calls purge until a batch comes back short.

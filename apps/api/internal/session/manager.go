@@ -68,11 +68,11 @@ func (e *QuotaError) Error() string { return ErrQuota.Error() }
 // know "over quota" can use errors.Is.
 func (e *QuotaError) Is(target error) bool { return target == ErrQuota }
 
-// Owner is who is asking. Hash is the hex SHA-256 of the browser's token, so
-// the manager never holds a token. Client is the network address the quota
-// counts against: several owners can share one.
+// Owner is who is asking. UserID is the signed-in user's id (users.id),
+// which the store keeps as the session's owner_id. Client is the network
+// address the per-client quota counts against: several users can share one.
 type Owner struct {
-	Hash   string
+	UserID string
 	Client string
 }
 
@@ -86,7 +86,7 @@ type Config struct {
 	Image        string        // absolute path, already validated by config
 	MemoryMB     int           // guest RAM, stored in each session's spec
 	Capacity     int           // sessions that may hold a VM at once
-	MaxPerOwner  int           // live sessions one Owner.Hash may hold, on any Client
+	MaxPerOwner  int           // live sessions one Owner.UserID may hold, on any Client
 	MaxPerClient int           // live sessions one Client may hold, across owners
 	IdleTimeout  time.Duration // no browser attached for this long -> delete
 	MaxDuration  time.Duration // hard lifetime -> delete
@@ -194,7 +194,7 @@ func New(cfg Config) (*Manager, error) {
 // errors.Is(ErrCapacity) or errors.Is(ErrBusy) work for the caller.
 func (m *Manager) Create(ctx context.Context, o Owner) (vm.Instance, error) {
 	s, err := m.store.Admit(ctx, NewSession{
-		OwnerID:     o.Hash,
+		OwnerID:     o.UserID,
 		ClientKey:   o.Client,
 		Profile:     defaultProfile,
 		ImageRef:    m.image,
@@ -228,7 +228,7 @@ func (m *Manager) Delete(ctx context.Context, id string, o Owner) error {
 		return err
 	}
 	// RequestDelete is idempotent, so two racing Deletes both succeed.
-	if err := m.store.RequestDelete(ctx, s.ID, o.Hash); err != nil {
+	if err := m.store.RequestDelete(ctx, s.ID, o.UserID); err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return notFound(id)
 		}
@@ -246,7 +246,7 @@ func (m *Manager) Delete(ctx context.Context, id string, o Owner) error {
 // deadline out; attaching alone does not.
 func (m *Manager) Console(ctx context.Context, id string, o Owner) (io.ReadWriteCloser, error) {
 	holder := newHolderID()
-	if err := m.store.AcquireAttach(ctx, id, o.Hash, holder, m.attachLease); err != nil {
+	if err := m.store.AcquireAttach(ctx, id, o.UserID, holder, m.attachLease); err != nil {
 		switch {
 		case errors.Is(err, ErrNotFound):
 			return nil, notFound(id)
@@ -397,7 +397,7 @@ func (c *activeConsole) touch() {
 // Store returns sessions marked for deletion too; hiding them is this
 // layer's choice (ADR 0010, section 4).
 func (m *Manager) visible(ctx context.Context, id string, o Owner) (Session, error) {
-	s, err := m.store.Get(ctx, id, o.Hash)
+	s, err := m.store.Get(ctx, id, o.UserID)
 	switch {
 	case errors.Is(err, ErrNotFound):
 		return Session{}, notFound(id)
