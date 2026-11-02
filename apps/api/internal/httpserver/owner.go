@@ -1,126 +1,115 @@
 package httpserver
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 
+	"github.com/os-playground-api/internal/auth"
 	"github.com/os-playground-api/internal/session"
 )
 
-// An owner token is 32 random bytes the browser makes for itself, base64url
-// without padding. It proves only "I am the browser that created this VM", so
-// the server needs no account to check it: it keeps the token's SHA-256 and
-// compares that. Neither the token nor its hash is ever logged.
-const tokenLen = 43
+// Auth is sign-in, as the server needs it: the OIDC routes, and who the
+// login-session cookie on a request belongs to. *auth.Service implements it.
+type Auth interface {
+	// Authenticate returns the signed-in user. auth.ErrNoSession means none;
+	// any other error is the store failing.
+	Authenticate(r *http.Request) (auth.User, error)
 
-// wsProtocol is the only subprotocol the terminal speaks. Browsers cannot set
-// headers on a WebSocket, so the token rides beside it as "token.<token>";
-// the server answers with wsProtocol alone, so the token is never echoed.
-const (
-	wsProtocol    = "os-playground.v1"
-	wsTokenPrefix = "token."
-)
-
-func validToken(s string) bool {
-	if len(s) != tokenLen {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		if !isTokenChar(s[i]) {
-			return false
-		}
-	}
-	return true
+	Login(w http.ResponseWriter, r *http.Request)
+	Callback(w http.ResponseWriter, r *http.Request)
+	Logout(w http.ResponseWriter, r *http.Request)
+	Me(w http.ResponseWriter, r *http.Request)
 }
 
-// isTokenChar reports whether c is in the base64url alphabet.
-func isTokenChar(c byte) bool {
-	return 'A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '-' || c == '_'
+// noAuth is used when sign-in is not configured: nobody is signed in, so
+// nobody can start a machine, and the server says why.
+type noAuth struct{}
+
+func (noAuth) Authenticate(*http.Request) (auth.User, error) { return auth.User{}, auth.ErrNoSession }
+
+func (noAuth) Login(w http.ResponseWriter, _ *http.Request) {
+	writeError(w, http.StatusServiceUnavailable, "sign-in is not configured on this server")
 }
 
-func hashToken(token string) string {
-	sum := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(sum[:])
+func (noAuth) Callback(w http.ResponseWriter, r *http.Request) { noAuth{}.Login(w, r) }
+
+func (noAuth) Logout(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }
+
+func (noAuth) Me(w http.ResponseWriter, _ *http.Request) {
+	writeError(w, http.StatusUnauthorized, "not signed in")
 }
 
-// bearerToken reads "Authorization: Bearer <token>". A missing header, a
-// repeated one, another scheme or a malformed token all fail.
-func bearerToken(r *http.Request) (string, bool) {
-	values := r.Header.Values("Authorization")
-	if len(values) != 1 {
-		return "", false
-	}
-	scheme, token, ok := strings.Cut(values[0], " ")
-	if !ok || !strings.EqualFold(scheme, "Bearer") || !validToken(token) {
-		return "", false
-	}
-	return token, true
-}
+// wsProtocol is the only subprotocol the terminal speaks. Who is asking
+// comes from the login cookie, which the browser sends with the upgrade.
+const wsProtocol = "os-playground.v1"
 
-// wsToken reads the token from Sec-WebSocket-Protocol. The offer must be
-// exactly wsProtocol and one token entry, in any order; anything else fails,
+// wsProtocolOffered reports whether the client offered exactly wsProtocol,
 // so a client that does not speak the protocol never gets as far as Accept.
-func wsToken(r *http.Request) (string, bool) {
-	var token string
-	protocols, tokens := 0, 0
+func wsProtocolOffered(r *http.Request) bool {
+	n := 0
 	for _, v := range r.Header.Values("Sec-WebSocket-Protocol") {
 		for _, p := range strings.Split(v, ",") {
-			switch p = strings.TrimSpace(p); {
-			case p == wsProtocol:
-				protocols++
-			case strings.HasPrefix(p, wsTokenPrefix):
-				tokens++
-				token = strings.TrimPrefix(p, wsTokenPrefix)
-			default:
-				return "", false
+			if strings.TrimSpace(p) != wsProtocol {
+				return false
 			}
+			n++
 		}
 	}
-	if protocols != 1 || tokens != 1 || !validToken(token) {
-		return "", false
-	}
-	return token, true
+	return n == 1
 }
 
-// owner builds the session.Owner for a request whose token has been read.
-func owner(r *http.Request, token string, proxyHops int) session.Owner {
-	return session.Owner{Hash: hashToken(token), Client: clientKey(r, proxyHops)}
-}
-
-// ownedHandler is a handler that cannot run without a verified owner.
+// ownedHandler is a handler that cannot run without a signed-in owner.
 type ownedHandler func(w http.ResponseWriter, r *http.Request, o session.Owner)
 
-// withOwner reads the token with read and passes the owner to next. Without a
-// valid token next never runs: refuse answers instead. Routes differ only in
-// where the token is and how a bad one is refused.
-func withOwner(read func(*http.Request) (string, bool), refuse http.HandlerFunc, proxyHops int, next ownedHandler) http.HandlerFunc {
+// withOwner authenticates the request and passes its owner to next. Without
+// a signed-in user next never runs: refuse answers instead. If the login
+// store fails, the answer is 500, never refuse: an outage must not look like
+// "you are signed out" or "no such VM".
+func withOwner(a Auth, log *slog.Logger, refuse http.HandlerFunc, proxyHops int, next ownedHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		token, ok := read(r)
-		if !ok {
+		u, err := a.Authenticate(r)
+		switch {
+		case errors.Is(err, auth.ErrNoSession):
 			refuse(w, r)
 			return
+		case err != nil:
+			log.Error("authenticate failed", "err", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
 		}
-		next(w, r, owner(r, token, proxyHops))
+		next(w, r, session.Owner{UserID: u.ID, Client: clientKey(r, proxyHops)})
 	}
 }
 
-// unauthorized refuses POST /playgrounds. It is the one route that says a token is
-// wrong, since there is no VM whose existence that could reveal.
-func unauthorized(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("WWW-Authenticate", "Bearer")
-	writeError(w, http.StatusUnauthorized, "missing or invalid token")
+// withWSProtocol refuses a WebSocket upgrade that does not offer exactly
+// wsProtocol, with the same answer as a missing VM.
+func withWSProtocol(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !wsProtocolOffered(r) {
+			wsNotFound(w, r)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// unauthorized refuses POST /playgrounds. It is the one route that says the
+// caller is not signed in, since there is no VM whose existence that could
+// reveal.
+func unauthorized(w http.ResponseWriter, _ *http.Request) {
+	writeError(w, http.StatusUnauthorized, "sign in to start a playground")
 }
 
 // vmNotFound and wsNotFound are the only way a VM route says "not found",
-// whatever the cause: no VM, another owner's, or a bad token. One function
+// whatever the cause: no VM, another user's, or not signed in. One function
 // per route keeps the answers identical, so none of them reveals which IDs
 // exist.
-func vmNotFound(w http.ResponseWriter, r *http.Request) {
+func vmNotFound(w http.ResponseWriter, _ *http.Request) {
 	writeError(w, http.StatusNotFound, "vm not found")
 }
 
-func wsNotFound(w http.ResponseWriter, r *http.Request) {
+func wsNotFound(w http.ResponseWriter, _ *http.Request) {
 	http.Error(w, "VM not found", http.StatusNotFound)
 }

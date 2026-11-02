@@ -28,13 +28,13 @@ func TestAnotherOwnerCannotGetAttachOrDelete(t *testing.T) {
 
 	for _, o := range []Owner{bob, carol, {Client: alice.Client}} {
 		if _, err := r.m.Get(ctx, id, o); !errors.Is(err, vm.ErrNotFound) {
-			t.Errorf("Get as %q = %v, want ErrNotFound", o.Hash, err)
+			t.Errorf("Get as %q = %v, want ErrNotFound", o.UserID, err)
 		}
 		if _, err := r.m.Console(ctx, id, o); !errors.Is(err, vm.ErrNotFound) {
-			t.Errorf("Console as %q = %v, want ErrNotFound", o.Hash, err)
+			t.Errorf("Console as %q = %v, want ErrNotFound", o.UserID, err)
 		}
 		if err := r.m.Delete(ctx, id, o); !errors.Is(err, vm.ErrNotFound) {
-			t.Errorf("Delete as %q = %v, want ErrNotFound", o.Hash, err)
+			t.Errorf("Delete as %q = %v, want ErrNotFound", o.UserID, err)
 		}
 	}
 
@@ -47,18 +47,18 @@ func TestTheOwnerIsTheTokenNotTheAddress(t *testing.T) {
 	r := newRig(t, roomy)
 	id := r.mustCreateAs(alice)
 
-	moved := Owner{Hash: alice.Hash, Client: "192.0.2.50"} // same browser, new network
+	moved := Owner{UserID: alice.UserID, Client: "192.0.2.50"} // same browser, new network
 	if _, err := r.m.Get(context.Background(), id, moved); err != nil {
 		t.Fatalf("Get from a new address = %v, want the session", err)
 	}
 }
 
-// Without a token there is no owner, so there is nothing to admit. The HTTP
+// Without a signed-in user there is no owner, so there is nothing to admit. The HTTP
 // layer refuses such a request before it gets here; reaching Admit is a bug.
-func TestEmptyHashCannotCreate(t *testing.T) {
+func TestNoUserCannotCreate(t *testing.T) {
 	r := newRig(t, roomy)
 	if _, err := r.createAs(Owner{Client: alice.Client}); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("Create with no hash = %v, want ErrInvalid", err)
+		t.Fatalf("Create with no user = %v, want ErrInvalid", err)
 	}
 }
 
@@ -68,12 +68,12 @@ func TestSecondCreateFromTheSameClientIsRefused(t *testing.T) {
 
 	_, err := r.createAs(alice)
 	if q := quotaError(t, err); !q.Yours || q.ID != id {
-		t.Errorf("same token: %+v, want Yours with ID %s", q, id)
+		t.Errorf("same user: %+v, want Yours with ID %s", q, id)
 	}
 
 	_, err = r.createAs(bob)
 	if q := quotaError(t, err); q.Yours || q.ID != "" || !q.ClientWide {
-		t.Errorf("same address, other token: %+v, want ClientWide and neither Yours nor an ID", q)
+		t.Errorf("same address, other user: %+v, want ClientWide and neither Yours nor an ID", q)
 	}
 
 	if _, err := r.createAs(carol); err != nil {
@@ -99,7 +99,7 @@ func TestQuotaNeverRevealsAnotherOwnersID(t *testing.T) {
 	r.mustCreateAs(alice)
 	r.mustCreateAs(bob)
 
-	_, err := r.createAs(Owner{Hash: "dddd", Client: alice.Client})
+	_, err := r.createAs(Owner{UserID: "dddd", Client: alice.Client})
 	if q := quotaError(t, err); q.Yours || q.ID != "" {
 		t.Fatalf("%+v, want neither Yours nor an ID", q)
 	}
@@ -110,10 +110,10 @@ func TestOwnerLimitHoldsAcrossNetworks(t *testing.T) {
 	r := newRig(t, Limits{Capacity: 10, PerOwner: 1, PerClient: 1000})
 	id := r.mustCreateAs(alice)
 
-	moved := Owner{Hash: alice.Hash, Client: "192.0.2.50"}
+	moved := Owner{UserID: alice.UserID, Client: "192.0.2.50"}
 	_, err := r.createAs(moved)
 	if q := quotaError(t, err); !q.Yours || q.ID != id {
-		t.Errorf("same token from another network: %+v, want Yours with ID %s", q, id)
+		t.Errorf("same user from another network: %+v, want Yours with ID %s", q, id)
 	}
 	r.mustCreateAs(bob) // same network as alice, another owner
 }
@@ -122,8 +122,8 @@ func TestOwnerLimitHoldsAcrossNetworks(t *testing.T) {
 // network still works but cannot flood with many browsers.
 func TestClientBackstopIsLooserThanOwnerLimit(t *testing.T) {
 	r := newRig(t, Limits{Capacity: 10, PerOwner: 1, PerClient: 3})
-	dave := Owner{Hash: "dddd", Client: alice.Client}
-	erin := Owner{Hash: "eeee", Client: alice.Client}
+	dave := Owner{UserID: "dddd", Client: alice.Client}
+	erin := Owner{UserID: "eeee", Client: alice.Client}
 
 	for _, o := range []Owner{alice, bob, dave} {
 		r.mustCreateAs(o)

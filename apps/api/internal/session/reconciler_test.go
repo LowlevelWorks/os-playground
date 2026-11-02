@@ -447,7 +447,7 @@ func TestTwoReconcilersNeverDoubleCreate(t *testing.T) {
 
 	const n = 20
 	for i := range n {
-		r.create(Owner{Hash: "owner" + string(rune('a'+i)), Client: carol.Client})
+		r.create(Owner{UserID: "owner" + string(rune('a'+i)), Client: carol.Client})
 	}
 
 	var wg sync.WaitGroup

@@ -52,14 +52,11 @@ type ownedBy struct {
 }
 
 func (o ownedBy) Console(ctx context.Context, id string, owner session.Owner) (io.ReadWriteCloser, error) {
-	if owner.Hash != o.hash {
+	if owner.UserID != o.hash {
 		return nil, fmt.Errorf("%w: %s", vm.ErrNotFound, id)
 	}
 	return o.f.Console(ctx, id)
 }
-
-// wsOffer is the Sec-WebSocket-Protocol offer the frontend sends.
-func wsOffer(token string) []string { return []string{wsProtocol, wsTokenPrefix + token} }
 
 // env is the handler behind a real HTTP server, in front of the fake provider
 // with one running VM owned by tokenA.
@@ -81,10 +78,10 @@ func newEnv(t *testing.T) *env {
 	}
 
 	logs := &syncBuffer{}
-	h := NewTerminalHandler(ownedBy{f, hashToken(tokenA)}, []string{"localhost:3000"},
+	h := NewTerminalHandler(ownedBy{f, userA}, []string{"localhost:3000"},
 		slog.New(slog.NewTextHandler(logs, nil)))
 	mux := http.NewServeMux()
-	terminalRoute(mux, h, 0)
+	terminalRoute(mux, h, fakeAuth{}, discard, 0)
 	srv := httptest.NewServer(mux)
 
 	t.Cleanup(func() {
@@ -107,17 +104,17 @@ func (e *env) url(id string) string {
 // check the status.
 func (e *env) dial(id, origin string) (*websocket.Conn, *http.Response, error) {
 	e.t.Helper()
-	return e.dialOffering(id, origin, wsOffer(tokenA))
+	return e.dialOffering(id, origin, tokenA, []string{wsProtocol})
 }
 
-func (e *env) dialOffering(id, origin string, protocols []string) (*websocket.Conn, *http.Response, error) {
+func (e *env) dialOffering(id, origin, token string, protocols []string) (*websocket.Conn, *http.Response, error) {
 	e.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	opts := &websocket.DialOptions{Subprotocols: protocols}
+	opts := &websocket.DialOptions{Subprotocols: protocols, HTTPHeader: sessionHeader(token)}
 	if origin != "" {
-		opts.HTTPHeader = http.Header{"Origin": {origin}}
+		opts.HTTPHeader.Set("Origin", origin)
 	}
 	c, resp, err := websocket.Dial(ctx, e.url(id), opts)
 	if c != nil {
@@ -220,7 +217,8 @@ func (s stubProvider) Console(context.Context, string, session.Owner) (io.ReadWr
 // attachRequest is a WebSocket attach request that gets past the token check.
 func attachRequest(id string) *http.Request {
 	r := httptest.NewRequest("GET", "/api/v1/ws/playgrounds/"+id, nil)
-	r.Header.Set("Sec-WebSocket-Protocol", strings.Join(wsOffer(tokenA), ", "))
+	r.Header.Set("Sec-WebSocket-Protocol", wsProtocol)
+	withSession(r, tokenA)
 	return r
 }
 
@@ -241,7 +239,7 @@ func TestAttachErrorsBecomeStatusCodes(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			h := NewTerminalHandler(stubProvider{err: tt.err}, nil, nil)
 			mux := http.NewServeMux()
-			terminalRoute(mux, h, 0)
+			terminalRoute(mux, h, fakeAuth{}, discard, 0)
 
 			rec := httptest.NewRecorder()
 			mux.ServeHTTP(rec, attachRequest("vm-1"))
@@ -261,7 +259,7 @@ func TestUnexpectedAttachErrorIsLoggedNotShown(t *testing.T) {
 	h := NewTerminalHandler(stubProvider{err: errors.New("disk on fire")}, nil,
 		slog.New(slog.NewTextHandler(&logs, nil)))
 	mux := http.NewServeMux()
-	terminalRoute(mux, h, 0)
+	terminalRoute(mux, h, fakeAuth{}, discard, 0)
 
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, attachRequest("vm-1"))
@@ -277,7 +275,7 @@ func TestUnexpectedAttachErrorIsLoggedNotShown(t *testing.T) {
 func TestNewHandlerWithoutLoggerDoesNotPanic(t *testing.T) {
 	h := NewTerminalHandler(stubProvider{err: errors.New("boom")}, nil, nil)
 	mux := http.NewServeMux()
-	terminalRoute(mux, h, 0)
+	terminalRoute(mux, h, fakeAuth{}, discard, 0)
 
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, attachRequest("vm-1")) // logs the 500
@@ -394,7 +392,8 @@ func TestFailedUpgradeFreesTheConsole(t *testing.T) {
 	// A plain request with the right offer, but no upgrade headers: the
 	// console is attached, then the upgrade fails.
 	req, _ := http.NewRequestWithContext(t.Context(), "GET", e.srv.URL+"/api/v1/ws/playgrounds/"+vmID, nil)
-	req.Header.Set("Sec-WebSocket-Protocol", strings.Join(wsOffer(tokenA), ", "))
+	req.Header.Set("Sec-WebSocket-Protocol", wsProtocol)
+	withSession(req, tokenA)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -464,7 +463,8 @@ func TestRequestsDuringShutdownDoNotRaceOrLeak(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			req, _ := http.NewRequestWithContext(t.Context(), "GET", e.srv.URL+"/api/v1/ws/playgrounds/"+vmID, nil)
-			req.Header.Set("Sec-WebSocket-Protocol", strings.Join(wsOffer(tokenA), ", "))
+			req.Header.Set("Sec-WebSocket-Protocol", wsProtocol)
+			withSession(req, tokenA)
 			resp, err := http.DefaultClient.Do(req)
 			if err == nil {
 				resp.Body.Close()

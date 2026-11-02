@@ -24,12 +24,12 @@ const (
 	maxLife   = time.Hour
 )
 
-// alice and bob share one address; carol is elsewhere. Hashes are opaque to
+// alice and bob share one address; carol is elsewhere. User IDs are opaque to
 // the manager, so short stand-ins do.
 var (
-	alice = Owner{Hash: "aaaa", Client: "203.0.113.1"}
-	bob   = Owner{Hash: "bbbb", Client: "203.0.113.1"}
-	carol = Owner{Hash: "cccc", Client: "198.51.100.7"}
+	alice = Owner{UserID: "aaaa", Client: "203.0.113.1"}
+	bob   = Owner{UserID: "bbbb", Client: "203.0.113.1"}
+	carol = Owner{UserID: "cccc", Client: "198.51.100.7"}
 )
 
 // roomy is for tests that are not about limits, so they never meet one.
@@ -95,7 +95,7 @@ func (r *rig) mustCreateAs(o Owner) string {
 	r.t.Helper()
 	id, err := r.createAs(o)
 	if err != nil {
-		r.t.Fatalf("Create as %s: %v", o.Hash, err)
+		r.t.Fatalf("Create as %s: %v", o.UserID, err)
 	}
 	return id
 }
@@ -193,7 +193,7 @@ func TestCreateChoosesTheSpecItself(t *testing.T) {
 	r := newRig(t, roomy)
 	id := r.mustCreateAs(alice)
 
-	s, err := r.store.Get(context.Background(), id, alice.Hash)
+	s, err := r.store.Get(context.Background(), id, alice.UserID)
 	if err != nil {
 		t.Fatalf("store.Get: %v", err)
 	}
@@ -346,7 +346,7 @@ func TestConcurrentUse(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			o := Owner{Hash: "owner" + strconv.Itoa(w), Client: alice.Client}
+			o := Owner{UserID: "owner" + strconv.Itoa(w), Client: alice.Client}
 			ctx := context.Background()
 			for range 20 {
 				inst, err := r.m.Create(ctx, o)
@@ -411,7 +411,7 @@ func TestFailedProviderAttachGivesTheLeaseBack(t *testing.T) {
 		t.Fatalf("Console = %v, want the provider's ErrNotFound", err)
 	}
 	waitFor(t, func() bool {
-		return r.store.AcquireAttach(context.Background(), id, alice.Hash, "other", time.Minute) == nil
+		return r.store.AcquireAttach(context.Background(), id, alice.UserID, "other", time.Minute) == nil
 	})
 }
 

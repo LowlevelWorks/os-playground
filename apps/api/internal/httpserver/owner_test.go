@@ -2,6 +2,8 @@ package httpserver
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -11,57 +13,20 @@ import (
 	"github.com/coder/websocket"
 )
 
-func TestBearerToken(t *testing.T) {
+func TestWSProtocolOffered(t *testing.T) {
 	tests := []struct {
 		name   string
 		header []string
 		ok     bool
 	}{
-		{"valid", []string{"Bearer " + tokenA}, true},
-		{"scheme is case-insensitive", []string{"bearer " + tokenA}, true},
-		{"missing", nil, false},
-		{"empty", []string{""}, false},
-		{"no scheme", []string{tokenA}, false},
-		{"other scheme", []string{"Basic " + tokenA}, false},
-		{"too short", []string{"Bearer " + tokenA[1:]}, false},
-		{"too long", []string{"Bearer " + tokenA + "A"}, false},
-		{"padding", []string{"Bearer " + tokenA[1:] + "="}, false},
-		{"standard base64 alphabet", []string{"Bearer " + tokenA[1:] + "+"}, false},
-		{"two spaces", []string{"Bearer  " + tokenA}, false},
-		{"repeated header", []string{"Bearer " + tokenA, "Bearer " + tokenB}, false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			r := httptest.NewRequest("GET", "/", nil)
-			for _, v := range tt.header {
-				r.Header.Add("Authorization", v)
-			}
-			got, ok := bearerToken(r)
-			if ok != tt.ok || (ok && got != tokenA) {
-				t.Fatalf("bearerToken = %q, %v; want ok=%v", got, ok, tt.ok)
-			}
-		})
-	}
-}
-
-func TestWSToken(t *testing.T) {
-	tok := wsTokenPrefix + tokenA
-	tests := []struct {
-		name   string
-		header []string
-		ok     bool
-	}{
-		{"valid", []string{wsProtocol + ", " + tok}, true},
-		{"either order", []string{tok + "," + wsProtocol}, true},
-		{"over two headers", []string{wsProtocol, tok}, true},
+		{"exactly the protocol", []string{wsProtocol}, true},
+		{"with spaces", []string{" " + wsProtocol + " "}, true},
 		{"no header", nil, false},
-		{"token only", []string{tok}, false},
-		{"subprotocol only", []string{wsProtocol}, false},
-		{"two token entries", []string{wsProtocol + ", " + tok + ", " + wsTokenPrefix + tokenB}, false},
-		{"subprotocol twice", []string{wsProtocol + ", " + wsProtocol + ", " + tok}, false},
-		{"something else offered too", []string{wsProtocol + ", " + tok + ", chat"}, false},
-		{"malformed token", []string{wsProtocol + ", " + wsTokenPrefix + "short"}, false},
-		{"other version", []string{"os-playground.v2, " + tok}, false},
+		{"twice", []string{wsProtocol + ", " + wsProtocol}, false},
+		{"over two headers", []string{wsProtocol, wsProtocol}, false},
+		{"something else offered too", []string{wsProtocol + ", chat"}, false},
+		{"a token, as the old protocol sent", []string{wsProtocol + ", token.abc"}, false},
+		{"other version", []string{"os-playground.v2"}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -69,30 +34,52 @@ func TestWSToken(t *testing.T) {
 			for _, v := range tt.header {
 				r.Header.Add("Sec-WebSocket-Protocol", v)
 			}
-			got, ok := wsToken(r)
-			if ok != tt.ok || (ok && got != tokenA) {
-				t.Fatalf("wsToken = %q, %v; want ok=%v", got, ok, tt.ok)
+			if got := wsProtocolOffered(r); got != tt.ok {
+				t.Fatalf("wsProtocolOffered = %v, want %v", got, tt.ok)
 			}
 		})
 	}
 }
 
-func TestCreateWithoutAValidTokenIs401(t *testing.T) {
+func TestCreateWithoutSigningInIs401(t *testing.T) {
 	a := newAPI(t, 2)
 	for _, token := range []string{"", "short", tokenA + "x"} {
 		rec := a.doAs(token, "", "POST", "/api/v1/playgrounds")
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("token %q: status = %d, want 401", token, rec.Code)
 		}
-		if got := decode(t, rec)["error"]; got != "missing or invalid token" {
+		if got := decode(t, rec)["error"]; got != "sign in to start a playground" {
 			t.Errorf("token %q: error = %v", token, got)
 		}
-		if rec.Header().Get("WWW-Authenticate") != "Bearer" {
-			t.Errorf("token %q: no WWW-Authenticate challenge", token)
+	}
+	// The old bearer token no longer signs anyone in.
+	r := httptest.NewRequest("POST", "/api/v1/playgrounds", nil)
+	r.Header.Set("Authorization", "Bearer "+tokenA)
+	rec := httptest.NewRecorder()
+	a.srv.ServeHTTP(rec, r)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("bearer token: status = %d, want 401", rec.Code)
+	}
+}
+
+// A store outage must never look like "signed out" or "no such VM".
+func TestAuthStoreFailureIs500(t *testing.T) {
+	var logs syncBuffer
+	mux := http.NewServeMux()
+	vmRoutes(mux, NewVMHandler(brokenVMs{}, nil), fakeAuth{err: errors.New("db down")}, slog.New(slog.NewTextHandler(&logs, nil)), 0)
+	for _, method := range []string{"POST", "GET", "DELETE"} {
+		path := "/api/v1/playgrounds"
+		if method != "POST" {
+			path += "/x"
+		}
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(method, path, nil))
+		if rec.Code != http.StatusInternalServerError {
+			t.Errorf("%s = %d, want 500", method, rec.Code)
 		}
 	}
-	if a.fake.Len() != 0 {
-		t.Fatal("a VM was created without a valid token")
+	if !strings.Contains(logs.String(), "db down") {
+		t.Errorf("the failure was not logged: %s", logs.String())
 	}
 }
 
@@ -182,11 +169,14 @@ func wsAPI(t *testing.T, a *api) string {
 	return "ws" + strings.TrimPrefix(srv.URL, "http")
 }
 
-func dialWS(t *testing.T, url string, protocols []string) (*websocket.Conn, int) {
+// dialWS opens a terminal signed in with token (none if empty), offering
+// protocols.
+func dialWS(t *testing.T, url, token string, protocols []string) (*websocket.Conn, int) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	c, resp, err := websocket.Dial(ctx, url, &websocket.DialOptions{Subprotocols: protocols}) //nolint:bodyclose // websocket.Dial: "You never need to close resp.Body yourself"
+	opts := &websocket.DialOptions{Subprotocols: protocols, HTTPHeader: sessionHeader(token)}
+	c, resp, err := websocket.Dial(ctx, url, opts) //nolint:bodyclose // websocket.Dial: "You never need to close resp.Body yourself"
 	if err != nil {
 		return nil, statusOf(resp)
 	}
@@ -202,35 +192,36 @@ func TestTerminalChecksTheOwnerBeforeUpgrading(t *testing.T) {
 
 	refused := []struct {
 		name      string
+		token     string
 		protocols []string
 	}{
-		{"another owner", wsOffer(tokenB)},
-		{"no subprotocol at all", nil},
-		{"token only", []string{wsTokenPrefix + tokenA}},
-		{"subprotocol only", []string{wsProtocol}},
+		{"another owner", tokenB, []string{wsProtocol}},
+		{"not signed in", "", []string{wsProtocol}},
+		{"no subprotocol at all", tokenA, nil},
+		{"another protocol too", tokenA, []string{wsProtocol, "chat"}},
 	}
 	for _, tt := range refused {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, status := dialWS(t, base+"/api/v1/ws/playgrounds/"+id, tt.protocols); status != http.StatusNotFound {
+			if _, status := dialWS(t, base+"/api/v1/ws/playgrounds/"+id, tt.token, tt.protocols); status != http.StatusNotFound {
 				t.Fatalf("dial = %d, want 404", status)
 			}
 		})
 	}
-	if _, status := dialWS(t, base+"/api/v1/ws/playgrounds/vm-0000000000000000000000", wsOffer(tokenA)); status != http.StatusNotFound {
+	if _, status := dialWS(t, base+"/api/v1/ws/playgrounds/vm-0000000000000000000000", tokenA, []string{wsProtocol}); status != http.StatusNotFound {
 		t.Fatalf("dial to a missing VM = %d, want 404", status)
 	}
 
-	c, _ := dialWS(t, base+"/api/v1/ws/playgrounds/"+id, wsOffer(tokenA))
+	c, _ := dialWS(t, base+"/api/v1/ws/playgrounds/"+id, tokenA, []string{wsProtocol})
 	if c == nil {
 		t.Fatal("the owner's dial was refused")
 	}
 	if got := c.Subprotocol(); got != wsProtocol {
-		t.Fatalf("negotiated subprotocol = %q, want %q and never the token", got, wsProtocol)
+		t.Fatalf("negotiated subprotocol = %q, want %q", got, wsProtocol)
 	}
 }
 
 // Every path, the failures included, goes through the logger here. None of it
-// may record a token, its hash, or the headers that carry them.
+// may record a login token or the header that carries it.
 func TestTokensNeverReachTheLogs(t *testing.T) {
 	a := newQuotaAPI(t, 4, 1)
 	id := decode(t, a.do("POST", "/api/v1/playgrounds"))["id"].(string)
@@ -244,9 +235,10 @@ func TestTokensNeverReachTheLogs(t *testing.T) {
 	a.doAs(tokenB, "", "DELETE", "/api/v1/playgrounds/"+id) // 404
 
 	base := wsAPI(t, a)
-	dialWS(t, base+"/api/v1/ws/playgrounds/"+id, wsOffer(tokenB)) // 404
-	if c, _ := dialWS(t, base+"/api/v1/ws/playgrounds/"+id, wsOffer(tokenA)); c != nil {
-		dialWS(t, base+"/api/v1/ws/playgrounds/"+id, wsOffer(tokenA)) // 409, already attached
+	ws := []string{wsProtocol}
+	dialWS(t, base+"/api/v1/ws/playgrounds/"+id, tokenB, ws) // 404
+	if c, _ := dialWS(t, base+"/api/v1/ws/playgrounds/"+id, tokenA, ws); c != nil {
+		dialWS(t, base+"/api/v1/ws/playgrounds/"+id, tokenA, ws) // 409, already attached
 		c.Close(websocket.StatusNormalClosure, "")
 	}
 
@@ -259,8 +251,7 @@ func TestTokensNeverReachTheLogs(t *testing.T) {
 		t.Fatalf("setup: nothing was logged: %q", out)
 	}
 	for _, secret := range []string{
-		tokenA, tokenB, hashToken(tokenA), hashToken(tokenB),
-		"Bearer", "Authorization", "Sec-WebSocket-Protocol", wsTokenPrefix,
+		tokenA, tokenB, "Cookie", sessionCookieName,
 	} {
 		if strings.Contains(out, secret) {
 			t.Errorf("the log contains %q:\n%s", secret, out)

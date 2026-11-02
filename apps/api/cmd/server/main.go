@@ -17,6 +17,7 @@ import (
 
 	"github.com/joho/godotenv"
 
+	"github.com/os-playground-api/internal/auth"
 	"github.com/os-playground-api/internal/config"
 	"github.com/os-playground-api/internal/database"
 	"github.com/os-playground-api/internal/httpserver"
@@ -103,7 +104,16 @@ func run() error {
 		return err
 	}
 
-	retention, closeRetention, err := newRetention(dbCtx, cfg, store, log)
+	logins, err := auth.NewPGStore(pool)
+	if err != nil {
+		return err
+	}
+	signIn, err := newSignIn(cfg, logins, log)
+	if err != nil {
+		return err
+	}
+
+	retention, closeRetention, err := newRetention(dbCtx, cfg, store, logins, log)
 	if err != nil {
 		return err
 	}
@@ -138,7 +148,7 @@ func run() error {
 		return err
 	}
 
-	api := httpserver.NewServer(manager, pool.Ping, cfg.AllowedOrigins, httpserver.RateLimits{
+	api := httpserver.NewServer(manager, signIn, pool.Ping, cfg.AllowedOrigins, httpserver.RateLimits{
 		RequestsPerSecond: cfg.RateLimitRPS,
 		Burst:             cfg.RateLimitBurst,
 		CreatesPerMinute:  cfg.CreateLimitPerMinute,
@@ -240,9 +250,12 @@ func shutdown(log *slog.Logger, api *httpserver.Server, srv *http.Server, provid
 // PLAYGROUND_RETENTION_DATABASE_URL they are kept, which is said loudly
 // because it means the retention policy is not being applied. The returned
 // func closes that connection pool.
-func newRetention(ctx context.Context, cfg config.Config, store session.Store, log *slog.Logger) (*session.Retention, func(), error) {
+func newRetention(ctx context.Context, cfg config.Config, store session.Store, logins session.LoginSessionPurger,
+	log *slog.Logger,
+) (*session.Retention, func(), error) {
 	rcfg := session.RetentionConfig{
 		Sessions:         store,
+		LoginSessions:    logins,
 		SessionRetention: cfg.SessionRetention,
 		AuditRetention:   cfg.AuditRetention,
 		Logger:           log,
@@ -270,4 +283,31 @@ func newRetention(ctx context.Context, cfg config.Config, store session.Store, l
 		return nil, nil, err
 	}
 	return r, closePool, nil
+}
+
+// newSignIn builds OIDC sign-in, or returns nil when it is not configured:
+// the server then runs, but nobody can sign in or start a machine.
+func newSignIn(cfg config.Config, store auth.Store, log *slog.Logger) (httpserver.Auth, error) {
+	if !cfg.SignInEnabled() {
+		log.Warn("sign-in is not configured: set " + config.EnvOIDCClientID + " and " +
+			config.EnvOIDCClientSecret + "; until then nobody can start a machine")
+		return nil, nil
+	}
+	s, err := auth.New(auth.Config{
+		Issuer:         cfg.OIDCIssuer,
+		ClientID:       cfg.OIDCClientID,
+		ClientSecret:   cfg.OIDCClientSecret.Reveal(),
+		PublicURL:      cfg.PublicURL,
+		CallbackPath:   httpserver.CallbackPath,
+		AllowedOrigins: cfg.AllowedOrigins,
+		SessionTTL:     cfg.LoginSessionTTL,
+		Store:          store,
+		RequestID:      session.RequestID,
+		Logger:         log,
+	})
+	if err != nil {
+		return nil, err
+	}
+	log.Info("sign-in enabled", "issuer", cfg.OIDCIssuer, "redirect_uri", cfg.PublicURL+httpserver.CallbackPath)
+	return s, nil
 }

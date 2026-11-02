@@ -19,26 +19,33 @@ type Server struct {
 // readyTimeout bounds one readiness check.
 const readyTimeout = 2 * time.Second
 
-// NewServer wires the routes and middleware. ready reports whether the
-// server's dependencies, such as the database, can serve requests; nil means
-// always ready. allowedOrigins are the full origins (scheme://host[:port])
-// permitted to call the API; the WebSocket handler uses the host-only form
-// for its own check, derived here.
-func NewServer(manager VMManager, ready func(context.Context) error, allowedOrigins []string, limits RateLimits, log *slog.Logger) *Server {
+// NewServer wires the routes and middleware. a signs users in; nil means
+// sign-in is not configured, so nobody can start a machine. ready reports
+// whether the server's dependencies, such as the database, can serve
+// requests; nil means always ready. allowedOrigins are the web app's full
+// origins (scheme://host[:port]): the only pages allowed to call the API
+// with the login cookie, and the only places a login returns to. The
+// WebSocket handler uses the host-only form for its own check.
+func NewServer(manager VMManager, a Auth, ready func(context.Context) error, allowedOrigins []string, limits RateLimits, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	if a == nil {
+		a = noAuth{}
 	}
 
 	vms := NewVMHandler(manager, log)
 	terminal := NewTerminalHandler(manager, originHosts(allowedOrigins), log)
 
 	mux := http.NewServeMux()
-	vmRoutes(mux, vms, limits.TrustedProxyHops)
-	// OPTIONS preflight for every /playgrounds* path. The CORS middleware answers it;
-	// without a route the mux would return 405.
-	mux.HandleFunc("OPTIONS "+apiPrefix+"/playgrounds", func(w http.ResponseWriter, r *http.Request) {})
-	mux.HandleFunc("OPTIONS "+apiPrefix+"/playgrounds/{id}", func(w http.ResponseWriter, r *http.Request) {})
-	terminalRoute(mux, terminal, limits.TrustedProxyHops)
+	vmRoutes(mux, vms, a, log, limits.TrustedProxyHops)
+	authRoutes(mux, a)
+	// OPTIONS preflight for every path the web app calls with fetch. The
+	// CORS middleware answers it; without a route the mux would return 405.
+	for _, p := range []string{"/playgrounds", "/playgrounds/{id}", "/auth/me", "/auth/logout"} {
+		mux.HandleFunc("OPTIONS "+apiPrefix+p, func(w http.ResponseWriter, r *http.Request) {})
+	}
+	terminalRoute(mux, terminal, a, log, limits.TrustedProxyHops)
 	// Outside the prefix: probes hit it directly, not through the web proxy.
 	// /healthz is liveness: the process answers. /readyz is readiness: it
 	// can also reach what it depends on, so a load balancer stops sending
@@ -62,6 +69,7 @@ func NewServer(manager VMManager, ready func(context.Context) error, allowedOrig
 	// Outermost first: the access log must see what recovery turned a panic into.
 	var h http.Handler = mux
 	h = rateLimit(limits, h)
+	h = sameOriginWrites(allowedOrigins, h)
 	h = cors(allowedOrigins, h)
 	h = recoverPanic(log, h)
 	h = accessLog(log, h)
@@ -76,18 +84,32 @@ func NewServer(manager VMManager, ready func(context.Context) error, allowedOrig
 // request: the access log would then never see the matched pattern.
 const apiPrefix = "/api/v1"
 
+// CallbackPath is where the identity provider sends the browser back after
+// sign-in. Register the API's public origin + CallbackPath with the provider.
+const CallbackPath = apiPrefix + "/auth/callback"
+
 // vmRoutes mounts the REST endpoints. Every one goes through withOwner, so no
 // handler runs without a verified owner. Tests mount routes with this too.
-func vmRoutes(mux *http.ServeMux, vms *VMHandler, proxyHops int) {
-	mux.HandleFunc("POST "+apiPrefix+"/playgrounds", withOwner(bearerToken, unauthorized, proxyHops, vms.Create))
-	mux.HandleFunc("GET "+apiPrefix+"/playgrounds/{id}", withOwner(bearerToken, vmNotFound, proxyHops, vms.Get))
-	mux.HandleFunc("DELETE "+apiPrefix+"/playgrounds/{id}", withOwner(bearerToken, vmNotFound, proxyHops, vms.Delete))
+func vmRoutes(mux *http.ServeMux, vms *VMHandler, a Auth, log *slog.Logger, proxyHops int) {
+	mux.HandleFunc("POST "+apiPrefix+"/playgrounds", withOwner(a, log, unauthorized, proxyHops, vms.Create))
+	mux.HandleFunc("GET "+apiPrefix+"/playgrounds/{id}", withOwner(a, log, vmNotFound, proxyHops, vms.Get))
+	mux.HandleFunc("DELETE "+apiPrefix+"/playgrounds/{id}", withOwner(a, log, vmNotFound, proxyHops, vms.Delete))
 }
 
 // terminalRoute mounts the console WebSocket: shutdown check first, then the
 // owner, then the attach.
-func terminalRoute(mux *http.ServeMux, terminal *TerminalHandler, proxyHops int) {
-	mux.Handle("GET "+apiPrefix+"/ws/playgrounds/{id}", terminal.admit(withOwner(wsToken, wsNotFound, proxyHops, terminal.Serve)))
+func terminalRoute(mux *http.ServeMux, terminal *TerminalHandler, a Auth, log *slog.Logger, proxyHops int) {
+	mux.Handle("GET "+apiPrefix+"/ws/playgrounds/{id}",
+		terminal.admit(withWSProtocol(withOwner(a, log, wsNotFound, proxyHops, terminal.Serve))))
+}
+
+// authRoutes mounts sign-in. Login and the callback are top-level browser
+// navigations; me and logout are called with fetch.
+func authRoutes(mux *http.ServeMux, a Auth) {
+	mux.HandleFunc("GET "+apiPrefix+"/auth/login", a.Login)
+	mux.HandleFunc("GET "+CallbackPath, a.Callback)
+	mux.HandleFunc("POST "+apiPrefix+"/auth/logout", a.Logout)
+	mux.HandleFunc("GET "+apiPrefix+"/auth/me", a.Me)
 }
 
 // originHosts returns the host:port part of each origin, which is the form

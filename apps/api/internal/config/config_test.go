@@ -402,3 +402,62 @@ func TestRetentionSettings(t *testing.T) {
 		}
 	}
 }
+
+func TestSignInSettings(t *testing.T) {
+	cfg, err := Load(env(nil))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.SignInEnabled() || cfg.OIDCIssuer != "https://accounts.google.com" || cfg.LoginSessionTTL != 168*time.Hour {
+		t.Errorf("defaults: enabled=%v issuer=%q ttl=%v", cfg.SignInEnabled(), cfg.OIDCIssuer, cfg.LoginSessionTTL)
+	}
+
+	on := map[string]string{
+		EnvOIDCClientID: "id.apps.googleusercontent.com", EnvOIDCClientSecret: "GOCSPX-s3cret",
+		EnvPublicURL: "https://play.example.com/",
+	}
+	cfg, err = Load(env(on))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.SignInEnabled() || cfg.PublicURL != "https://play.example.com" || cfg.OIDCClientSecret.Reveal() != "GOCSPX-s3cret" {
+		t.Errorf("got enabled=%v public=%q", cfg.SignInEnabled(), cfg.PublicURL)
+	}
+	var logs strings.Builder
+	slog.New(slog.NewTextHandler(&logs, nil)).Info("x", "config", cfg)
+	if strings.Contains(logs.String(), "s3cret") || strings.Contains(fmt.Sprintf("%+v", cfg), "s3cret") {
+		t.Errorf("the client secret is shown: %s", logs.String())
+	}
+
+	with := func(kv ...string) map[string]string {
+		m := map[string]string{}
+		for k, v := range on {
+			m[k] = v
+		}
+		for i := 0; i < len(kv); i += 2 {
+			m[kv[i]] = kv[i+1]
+		}
+		return m
+	}
+	for name, bad := range map[string]map[string]string{
+		"secret without id":    {EnvOIDCClientSecret: "x"},
+		"id without secret":    {EnvOIDCClientID: "x"},
+		"no public url":        with(EnvPublicURL, ""),
+		"public url with path": with(EnvPublicURL, "https://play.example.com/api"),
+		"plain http elsewhere": with(EnvPublicURL, "http://play.example.com"),
+		"issuer over http":     with(EnvOIDCIssuer, "http://accounts.google.com"),
+		"login lasts too long": {EnvLoginSessionTTL: "1000h"},
+		"not a public url":     with(EnvPublicURL, "play.example.com"),
+	} {
+		if _, err := Load(env(bad)); err == nil {
+			t.Errorf("%s: Load = nil, want an error", name)
+		} else if strings.Contains(err.Error(), "s3cret") {
+			t.Errorf("%s: error leaks the secret: %v", name, err)
+		}
+	}
+	for _, ok := range []string{"http://localhost:8080", "http://127.0.0.1:8080", "http://[::1]:8080"} {
+		if _, err := Load(env(with(EnvPublicURL, ok))); err != nil {
+			t.Errorf("PublicURL %s: %v, want allowed for local development", ok, err)
+		}
+	}
+}

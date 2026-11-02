@@ -44,7 +44,7 @@ func (r *recRig) deletedSessions(n int) []string {
 	r.t.Helper()
 	ids := make([]string, n)
 	for i := range n {
-		o := Owner{Hash: "owner" + string(rune('a'+i)), Client: carol.Client}
+		o := Owner{UserID: "owner" + string(rune('a'+i)), Client: carol.Client}
 		ids[i] = r.create(o)
 		if err := r.m.Delete(context.Background(), ids[i], o); err != nil {
 			r.t.Fatal(err)
@@ -64,22 +64,22 @@ func TestRetentionPurgesEachKindAfterItsPeriod(t *testing.T) {
 	ctx := context.Background()
 
 	r.clk.Advance(keepSessions - time.Hour)
-	if s, e, err := ret.PurgeOnce(ctx); err != nil || s != 0 || e != 0 {
-		t.Fatalf("before 30 days: %d sessions, %d events, %v; want nothing", s, e, err)
+	if p, err := ret.PurgeOnce(ctx); err != nil || p.any() {
+		t.Fatalf("before 30 days: %+v, %v; want nothing", p, err)
 	}
 
 	r.clk.Advance(2 * time.Hour)
-	s, e, err := ret.PurgeOnce(ctx)
-	if err != nil || s != 5 || e != 0 {
-		t.Fatalf("after 30 days: %d sessions, %d events, %v; want all 5 sessions, no events", s, e, err)
+	p, err := ret.PurgeOnce(ctx)
+	if err != nil || p.Sessions != 5 || p.AuditEvents != 0 {
+		t.Fatalf("after 30 days: %+v, %v; want all 5 sessions, no events", p, err)
 	}
 	if es, _ := r.store.AuditEvents(ctx, ids[0]); len(es) == 0 {
 		t.Fatal("audit history went with the session row")
 	}
 
 	r.clk.Advance(keepAudit - keepSessions)
-	if _, e, err := ret.PurgeOnce(ctx); err != nil || e == 0 {
-		t.Fatalf("after 90 days: %d events, %v; want them purged", e, err)
+	if p, err := ret.PurgeOnce(ctx); err != nil || p.AuditEvents == 0 {
+		t.Fatalf("after 90 days: %+v, %v; want events purged", p, err)
 	}
 	for _, id := range ids {
 		if es, _ := r.store.AuditEvents(ctx, id); len(es) != 0 {
@@ -94,8 +94,8 @@ func TestRetentionWithoutAnAuditPurgerKeepsEvents(t *testing.T) {
 	ret := newRetention(t, r.store, nil)
 
 	r.clk.Advance(365 * 24 * time.Hour)
-	if s, e, err := ret.PurgeOnce(context.Background()); err != nil || s != 1 || e != 0 {
-		t.Fatalf("PurgeOnce = %d, %d, %v; want the session only", s, e, err)
+	if p, err := ret.PurgeOnce(context.Background()); err != nil || p.Sessions != 1 || p.AuditEvents != 0 {
+		t.Fatalf("PurgeOnce = %+v, %v; want the session only", p, err)
 	}
 	if es, _ := r.store.AuditEvents(context.Background(), ids[0]); len(es) == 0 {
 		t.Fatal("events were purged without an audit purger")
@@ -117,8 +117,29 @@ func (brokenPurger) PurgeAuditEvents(context.Context, time.Duration, int) (int, 
 
 func TestRetentionSkipsABusyPurgeAndReportsAFailedOne(t *testing.T) {
 	ret := newRetention(t, busyStore{}, brokenPurger{})
-	_, _, err := ret.PurgeOnce(context.Background())
+	_, err := ret.PurgeOnce(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "set role") || errors.Is(err, ErrBusy) {
 		t.Fatalf("PurgeOnce = %v, want only the audit purger's error", err)
+	}
+}
+
+type countingLogins struct{ left int }
+
+func (c *countingLogins) PurgeExpired(_ context.Context, limit int) (int, error) {
+	n := min(c.left, limit)
+	c.left -= n
+	return n, nil
+}
+
+func TestRetentionPurgesExpiredLoginSessions(t *testing.T) {
+	logins := &countingLogins{left: 5}
+	ret, err := NewRetention(RetentionConfig{
+		Sessions: NewMemStore(time.Now), SessionRetention: keepSessions, LoginSessions: logins, Batch: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, err := ret.PurgeOnce(context.Background()); err != nil || p.LoginSessions != 5 {
+		t.Fatalf("PurgeOnce = %+v, %v; want 5 login sessions over several batches", p, err)
 	}
 }
