@@ -2,13 +2,14 @@ package session
 
 import (
 	"bytes"
+	"cmp"
 	"context"
-	"crypto/rand"
 	"crypto/subtle"
-	"encoding/binary"
-	"fmt"
+	"slices"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // MemStore is the in-memory Store: the reference implementation the contract
@@ -28,8 +29,17 @@ type row struct {
 	s Session
 
 	// vmReleasedAt is vm_released_at: zero while the row holds a VM or is
-	// about to. Nothing sets it until the reconciler exists.
+	// about to.
 	vmReleasedAt time.Time
+
+	// The reconciler's columns, zero when unset.
+	startedAt    time.Time
+	terminatedAt time.Time
+	lastActivity time.Time
+	claimedBy    string
+	claimUntil   time.Time
+	nextAttempt  time.Time
+	attempts     int
 
 	// seq is insertion order, the tie-break when two rows share CreatedAt.
 	seq uint64
@@ -56,15 +66,7 @@ func NewMemStore(now func() time.Time) *MemStore {
 // Admit implements Store.Admit. It holds m.mu for the whole count, check and
 // insert, which is what the advisory lock does in PostgreSQL.
 func (m *MemStore) Admit(ctx context.Context, n NewSession, l Limits) (Session, error) {
-	if err := ctx.Err(); err != nil {
-		return Session{}, err
-	}
-
-	if err := n.validate(); err != nil {
-		return Session{}, err
-	}
-
-	if err := l.validate(); err != nil {
+	if err := checkAdmit(ctx, n, l); err != nil {
 		return Session{}, err
 	}
 
@@ -125,7 +127,7 @@ func (m *MemStore) Admit(ctx context.Context, n NewSession, l Limits) (Session, 
 
 	r := &row{
 		s: Session{
-			ID:            newID(now),
+			ID:            uuid.Must(uuid.NewV7()).String(),
 			OwnerID:       n.OwnerID,
 			ClientKey:     n.ClientKey,
 			Profile:       n.Profile,
@@ -136,7 +138,8 @@ func (m *MemStore) Admit(ctx context.Context, n NewSession, l Limits) (Session, 
 			ExpiresAt:     now.Add(n.MaxDuration),
 			IdleExpiresAt: now.Add(n.IdleTimeout),
 		},
-		seq: m.seq,
+		nextAttempt: now,
+		seq:         m.seq,
 	}
 	m.rows[r.s.ID] = r
 	return r.copy(), nil
@@ -148,10 +151,15 @@ func (m *MemStore) Get(ctx context.Context, id, ownerID string) (Session, error)
 		return Session{}, err
 	}
 
+	cid, ok := canonicalID(id)
+	if !ok {
+		return Session{}, ErrNotFound
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	r, ok := m.owned(id, ownerID)
+	r, ok := m.owned(cid, ownerID)
 	if !ok {
 		return Session{}, ErrNotFound
 	}
@@ -165,15 +173,143 @@ func (m *MemStore) RequestDelete(ctx context.Context, id, ownerID string) error 
 		return err
 	}
 
+	cid, ok := canonicalID(id)
+	if !ok {
+		return ErrNotFound
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	r, ok := m.owned(id, ownerID)
+	r, ok := m.owned(cid, ownerID)
 	if !ok {
 		return ErrNotFound
 	}
 
 	r.s.DesiredDeleted = true
+	r.nextAttempt = m.now().UTC()
+	return nil
+}
+
+// Claim implements Store.Claim.
+func (m *MemStore) Claim(ctx context.Context, worker string, lease time.Duration, limit int) ([]Claim, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if worker == "" || lease <= 0 || limit < 1 {
+		return nil, ErrInvalid
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := m.now().UTC()
+	var due []*row
+	for _, r := range m.rows {
+		if r.s.Status != StatusDeleted && !r.nextAttempt.After(now) &&
+			(r.claimUntil.IsZero() || r.claimUntil.Before(now)) {
+			due = append(due, r)
+		}
+	}
+	slices.SortFunc(due, func(a, b *row) int {
+		if c := a.nextAttempt.Compare(b.nextAttempt); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.seq, b.seq)
+	})
+	if len(due) > limit {
+		due = due[:limit]
+	}
+
+	out := make([]Claim, 0, len(due))
+	for _, r := range due {
+		r.claimedBy = worker
+		r.claimUntil = now.Add(lease).Truncate(time.Microsecond)
+		out = append(out, Claim{
+			Session:      r.copy(),
+			Worker:       worker,
+			VMReleased:   !r.vmReleasedAt.IsZero(),
+			TerminatedAt: r.terminatedAt,
+			Attempts:     r.attempts,
+		})
+	}
+	return out, nil
+}
+
+// Complete implements Store.Complete.
+func (m *MemStore) Complete(ctx context.Context, c Claim, res Result) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := res.validate(c); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	r, ok := m.rows[c.ID]
+	if !ok || c.Worker == "" || r.claimedBy != c.Worker {
+		return ErrLeaseLost
+	}
+
+	now := m.now().UTC().Truncate(time.Microsecond)
+	if res.Status != "" {
+		r.s.Status = res.Status
+		if res.Status == StatusRunning && r.startedAt.IsZero() {
+			r.startedAt = now
+		}
+		if res.Status.terminal() && r.terminatedAt.IsZero() {
+			r.terminatedAt = now
+		}
+	}
+	if res.FailureReason != "" {
+		r.s.FailureReason = res.FailureReason
+	}
+	if res.DesireDeleted {
+		r.s.DesiredDeleted = true
+	}
+	if res.VMReleased && r.vmReleasedAt.IsZero() {
+		r.vmReleasedAt = now
+	}
+	if res.Failed {
+		r.attempts++
+	} else {
+		r.attempts = 0
+	}
+	r.nextAttempt = now.Add(res.RetryAfter)
+	if r.s.DesiredDeleted {
+		r.nextAttempt = now
+	}
+	r.claimedBy, r.claimUntil = "", time.Time{}
+	return nil
+}
+
+// TouchActivity implements Store.TouchActivity.
+func (m *MemStore) TouchActivity(ctx context.Context, id string, idleFor time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if idleFor <= 0 {
+		return ErrInvalid
+	}
+	cid, ok := canonicalID(id)
+	if !ok {
+		return ErrNotFound
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	r, ok := m.rows[cid]
+	if !ok {
+		return ErrNotFound
+	}
+	now := m.now().UTC().Truncate(time.Microsecond)
+	r.lastActivity = now
+	if until := now.Add(idleFor); until.After(r.s.IdleExpiresAt) {
+		r.s.IdleExpiresAt = until
+	}
 	return nil
 }
 
@@ -204,21 +340,8 @@ func older(a, b *row) bool {
 	return a.seq < b.seq
 }
 
-// sameOwner compares in constant time, as owns does. The empty owner
-// owns nothing.
+// sameOwner compares in constant time, so timing does not leak a hash. The
+// empty owner owns nothing.
 func sameOwner(stored, given string) bool {
 	return given != "" && subtle.ConstantTimeCompare([]byte(stored), []byte(given)) == 1
-}
-
-// newID returns a UUIDv7 in its text form, the same shape PostgreSQL's
-// uuidv7() gives. Callers must not depend on the format.
-func newID(now time.Time) string {
-	var b [16]byte
-	var ms [8]byte
-	binary.BigEndian.PutUint64(ms[:], uint64(now.UnixMilli()))
-	copy(b[:6], ms[2:])
-	_, _ = rand.Read(b[6:]) // never fails since Go 1.24
-	b[6] = b[6]&0x0f | 0x70 // version 7
-	b[8] = b[8]&0x3f | 0x80 // RFC 9562 variant
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }

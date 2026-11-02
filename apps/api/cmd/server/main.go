@@ -23,10 +23,8 @@ import (
 	"github.com/os-playground-api/internal/vm/localqemu"
 )
 
-const (
-	reapInterval = 15 * time.Second
-	stepTimeout  = 5 * time.Second // each shutdown step gets its own
-)
+// stepTimeout bounds each shutdown step.
+const stepTimeout = 5 * time.Second
 
 func main() {
 	healthcheck := flag.Bool("healthcheck", false, "ask a running server's /healthz and exit 0 if it answers, 1 if not")
@@ -72,7 +70,7 @@ func run() error {
 	defer cancel()
 
 	// The pool is opened now so a bad URL or an unreachable database fails at
-	// startup. session.Store takes it over in ADR 0010 stage 3.2.
+	// startup.
 	pool, err := database.New(dbCtx, cfg.DatabaseURL.Reveal(), int32(cfg.DBMaxConns)) //nolint:gosec // G115: Load bounds DBMaxConns to 1..1000
 	if err != nil {
 		return fmt.Errorf("connect database: %w", err)
@@ -99,14 +97,34 @@ func run() error {
 		}
 	}()
 
+	store, err := session.NewPGStore(pool, cfg.AdmissionLockWait)
+	if err != nil {
+		return err
+	}
+
+	// The reconciler is the only code that creates or deletes VMs (ADR 0010,
+	// section 2). Handlers only change rows, then wake it.
+	reconciler, err := session.NewReconciler(session.ReconcilerConfig{
+		Store:            store,
+		Provider:         provider,
+		FailedVisibleFor: cfg.FailedVisibleFor,
+		Logger:           log,
+	})
+	if err != nil {
+		return err
+	}
+
 	manager, err := session.New(session.Config{
+		Store:        store,
 		Provider:     provider,
 		Image:        cfg.ImagePath,
 		MemoryMB:     cfg.VMMemoryMB,
+		Capacity:     cfg.MaxSessions,
 		MaxPerOwner:  cfg.MaxSessionsPerUser,
 		MaxPerClient: cfg.MaxSessionsPerClient,
 		IdleTimeout:  cfg.IdleTimeout,
 		MaxDuration:  cfg.MaxDuration,
+		Wake:         reconciler.Wake,
 		Logger:       log,
 	})
 	if err != nil {
@@ -138,10 +156,14 @@ func run() error {
 		return err
 	}
 
-	reaperDone := make(chan struct{})
+	// The reconciler has its own context: shutdown stops it after HTTP, so a
+	// DELETE accepted during the drain is still acted on.
+	recCtx, stopReconciler := context.WithCancel(context.Background())
+	defer stopReconciler()
+	reconcilerDone := make(chan struct{})
 	go func() {
-		defer close(reaperDone)
-		manager.Run(ctx, reapInterval)
+		defer close(reconcilerDone)
+		reconciler.Run(recCtx)
 	}()
 
 	serveErr := make(chan error, 1)
@@ -158,10 +180,10 @@ func run() error {
 		}
 	}
 	// Restores default signal handling, so a second Ctrl-C ends the process at
-	// once if shutdown hangs. It also stops the reaper if we got here by error.
+	// once if shutdown hangs.
 	stop()
 
-	err = errors.Join(runErr, shutdown(log, api, srv, provider, reaperDone))
+	err = errors.Join(runErr, shutdown(log, api, srv, provider, stopReconciler, reconcilerDone))
 	if err == nil {
 		log.Info("stopped")
 	}
@@ -170,8 +192,11 @@ func run() error {
 
 // shutdown stops everything in dependency order, each step with its own
 // timeout, and keeps going when one fails. Terminals are ended first so they
-// close cleanly; the provider goes last because everything above uses it.
-func shutdown(log *slog.Logger, api *httpserver.Server, srv *http.Server, provider *localqemu.Provider, reaperDone <-chan struct{}) error {
+// close cleanly; the reconciler stops after HTTP so requests accepted while
+// draining are acted on; the provider goes last because everything above uses it.
+func shutdown(log *slog.Logger, api *httpserver.Server, srv *http.Server, provider *localqemu.Provider,
+	stopReconciler context.CancelFunc, reconcilerDone <-chan struct{},
+) error {
 	var errs []error
 	step := func(name string, f func(context.Context) error) {
 		ctx, cancel := context.WithTimeout(context.Background(), stepTimeout)
@@ -184,9 +209,10 @@ func shutdown(log *slog.Logger, api *httpserver.Server, srv *http.Server, provid
 
 	step("terminals", api.Shutdown)
 	step("http server", srv.Shutdown)
-	step("session reaper", func(ctx context.Context) error {
+	step("reconciler", func(ctx context.Context) error {
+		stopReconciler()
 		select {
-		case <-reaperDone:
+		case <-reconcilerDone:
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()

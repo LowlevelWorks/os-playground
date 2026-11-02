@@ -118,11 +118,8 @@ func TestAnotherOwnersVMLooksExactlyLikeNoVM(t *testing.T) {
 		}
 	}
 
-	if a.fake.Len() != 1 {
-		t.Fatal("another owner's DELETE removed the VM")
-	}
 	if rec := a.do("GET", "/api/playgrounds/"+id); rec.Code != http.StatusOK {
-		t.Fatalf("the owner's GET = %d, want 200", rec.Code)
+		t.Fatalf("the owner's GET = %d, want 200: another owner's DELETE took effect", rec.Code)
 	}
 }
 
@@ -157,8 +154,8 @@ func TestQuotaIs409AndSaysWhoseVMItIs(t *testing.T) {
 	if rec := a.doAs(tokenB, elsewhere, "POST", "/api/playgrounds"); rec.Code != http.StatusCreated {
 		t.Fatalf("another address = %d, want 201", rec.Code)
 	}
-	if a.fake.Len() != 2 {
-		t.Fatalf("provider holds %d VMs, want 2", a.fake.Len())
+	if a.fake.Len() != 0 {
+		t.Fatalf("provider holds %d VMs, want 0: POST must not call it", a.fake.Len())
 	}
 }
 
@@ -192,6 +189,7 @@ func dialWS(t *testing.T, url string, protocols []string) (*websocket.Conn, int)
 func TestTerminalChecksTheOwnerBeforeUpgrading(t *testing.T) {
 	a := newAPI(t, 2)
 	id := decode(t, a.do("POST", "/api/playgrounds"))["id"].(string)
+	a.boot(id)
 	base := wsAPI(t, a)
 
 	refused := []struct {
@@ -228,6 +226,7 @@ func TestTerminalChecksTheOwnerBeforeUpgrading(t *testing.T) {
 func TestTokensNeverReachTheLogs(t *testing.T) {
 	a := newQuotaAPI(t, 4, 1)
 	id := decode(t, a.do("POST", "/api/playgrounds"))["id"].(string)
+	a.boot(id)
 
 	a.do("POST", "/api/playgrounds")                     // 409, yours
 	a.doAs(tokenB, "", "POST", "/api/playgrounds")       // 409, not yours
