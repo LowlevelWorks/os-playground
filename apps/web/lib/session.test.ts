@@ -4,8 +4,6 @@ import { SessionController, type SessionState, type SocketLike } from "./session
 
 const vm = (status: VMStatus, id = "vm-1"): VM => ({ id, status, created_at: "" });
 
-const TOKEN = "T".repeat(43);
-
 class FakeSocket implements SocketLike {
   binaryType = "blob";
   readyState = 0;
@@ -58,7 +56,6 @@ function setup(over: { api?: Partial<Api>; startTimeoutMs?: number; sleep?: () =
     wsBase: "ws://api.test",
     onState: (s) => states.push(s),
     onOutput: (d) => output.push([...d]),
-    token: () => TOKEN,
     openSocket: (url, protocols) => {
       const s = new FakeSocket(url, protocols);
       sockets.push(s);
@@ -80,8 +77,7 @@ describe("starting a session", () => {
     await t.controller.start();
     expect(t.kinds()).toEqual(["creating", "starting", "connecting"]);
     expect(t.sockets[0].url).toBe("ws://api.test/v1/ws/playgrounds/vm-1");
-    expect(t.sockets[0].url).not.toContain(TOKEN);
-    expect(t.sockets[0].protocols).toEqual(["os-playground.v1", `token.${TOKEN}`]);
+    expect(t.sockets[0].protocols).toEqual(["os-playground.v1"]);
     expect(t.sockets[0].binaryType).toBe("arraybuffer");
 
     t.sockets[0].open();
@@ -132,6 +128,15 @@ describe("starting a session", () => {
 
     expect(last(t.states)).toMatchObject({ kind: "error", canRetry: true });
     expect((last(t.states) as { message: string }).message).toContain("Can't reach the server");
+  });
+
+  it("asks to sign in again when the sign-in has ended", async () => {
+    const t = setup({ api: { createVM: async () => { throw new ApiError(401, "sign in to start a playground"); } } });
+
+    await t.controller.start();
+
+    expect(last(t.states)).toMatchObject({ kind: "error", canRetry: false, signedOut: true });
+    expect((last(t.states) as { message: string }).message).toContain("Sign in again");
   });
 
   it("fails when the machine fails to start", async () => {

@@ -1,5 +1,4 @@
 import { ApiError, type Api, type VM } from "./api";
-import { getToken } from "./token";
 
 /**
  * Where a session is. The UI renders this and nothing else, so every way a
@@ -22,8 +21,10 @@ export type SessionState =
     /** The VM is gone for good: forget it and start a new one. */
     gone?: boolean;
     retryAfterSec?: number;
-    /** A machine of this browser's that is in the way and can be resumed. */
+    /** A machine of this user's that is in the way and can be resumed. */
     resumeId?: string;
+    /** The sign-in has ended: the page should offer to sign in again. */
+    signedOut?: boolean;
   };
 
 /** The part of WebSocket this module uses, so tests can supply a fake. */
@@ -46,8 +47,6 @@ export interface SessionOptions {
   /** Bytes from the guest, in order. */
   onOutput(data: Uint8Array): void;
 
-  /** This browser's owner token; defaults to the stored one. */
-  token?: () => string;
   /** Opens the console socket, offering these subprotocols. */
   openSocket?: (url: string, protocols: string[]) => SocketLike;
   pollIntervalMs?: number;
@@ -56,9 +55,8 @@ export interface SessionOptions {
   now?: () => number;
 }
 
-/** The terminal protocol. The token rides beside it, since a browser cannot set headers on a WebSocket. */
+/** The terminal protocol. Who is asking comes from the login cookie, which the browser sends with the upgrade. */
 const WS_PROTOCOL = "os-playground.v1";
-const WS_TOKEN_PREFIX = "token.";
 
 const SOCKET_OPEN = 1;
 const NORMAL_CLOSURE = 1000;
@@ -82,7 +80,6 @@ export class SessionController {
   private readonly startTimeoutMs: number;
   private readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
   private readonly now: () => number;
-  private readonly token: () => string;
 
   private generation = 0;
   private kind: SessionState["kind"] = "idle";
@@ -96,7 +93,6 @@ export class SessionController {
     this.startTimeoutMs = opts.startTimeoutMs ?? 60_000;
     this.sleep = opts.sleep ?? defaultSleep;
     this.now = opts.now ?? Date.now;
-    this.token = opts.token ?? getToken;
   }
 
   /**
@@ -248,10 +244,7 @@ export class SessionController {
     this.set(run, { kind: "connecting", id });
 
     const open = this.opts.openSocket ?? ((url: string, protocols: string[]) => new WebSocket(url, protocols));
-    const socket = open(`${this.opts.wsBase}/v1/ws/playgrounds/${encodeURIComponent(id)}`, [
-      WS_PROTOCOL,
-      WS_TOKEN_PREFIX + this.token(),
-    ]);
+    const socket = open(`${this.opts.wsBase}/v1/ws/playgrounds/${encodeURIComponent(id)}`, [WS_PROTOCOL]);
     socket.binaryType = "arraybuffer";
     this.socket = socket;
     let opened = false;
@@ -319,6 +312,7 @@ interface Failure {
   gone?: boolean;
   retryAfterSec?: number;
   resumeId?: string;
+  signedOut?: boolean;
 }
 
 /** Turn an error into words a visitor can act on. */
@@ -339,6 +333,9 @@ function describe(err: unknown): Failure {
     }
     if (err.status === 0) {
       return { message: "Can't reach the server. Check that the API is running.", canRetry: true };
+    }
+    if (err.status === 401) {
+      return { message: "Your sign-in has ended. Sign in again to continue.", canRetry: false, signedOut: true };
     }
     if (err.status === 404) {
       return { message: "This session no longer exists.", canRetry: false, gone: true };

@@ -517,8 +517,8 @@ func older(a, b *row) bool {
 	return a.seq < b.seq
 }
 
-// sameOwner compares in constant time, so timing does not leak a hash. The
-// empty owner owns nothing.
+// sameOwner compares in constant time, so timing does not reveal which
+// owner IDs exist. The empty owner owns nothing.
 func sameOwner(stored, given string) bool {
 	return given != "" && subtle.ConstantTimeCompare([]byte(stored), []byte(given)) == 1
 }

@@ -32,8 +32,8 @@ type api struct {
 // Owner tokens for tests: the right length and alphabet, and easy to spot in
 // a log.
 var (
-	tokenA = strings.Repeat("A", tokenLen)
-	tokenB = strings.Repeat("B", tokenLen)
+	tokenA = strings.Repeat("A", 43)
+	tokenB = strings.Repeat("B", 43)
 )
 
 // newAPI allows each owner and client more sessions than capacity, so tests
@@ -62,7 +62,7 @@ func newQuotaAPI(t *testing.T, capacity, perClient int) *api {
 		t.Fatalf("session.New: %v", err)
 	}
 	logs := &syncBuffer{}
-	srv := NewServer(m, nil, []string{"http://localhost:3000"}, RateLimits{}, slog.New(slog.NewTextHandler(logs, nil)))
+	srv := NewServer(m, fakeAuth{}, nil, []string{"http://localhost:3000"}, RateLimits{}, slog.New(slog.NewTextHandler(logs, nil)))
 	return &api{t: t, fake: f, store: store, srv: srv, logs: logs}
 }
 
@@ -85,9 +85,7 @@ func (a *api) do(method, path string) *httptest.ResponseRecorder {
 // httptest default if empty).
 func (a *api) doAs(token, remote, method, path string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, path, nil)
-	if token != "" {
-		r.Header.Set("Authorization", "Bearer "+token)
-	}
+	withSession(r, token)
 	if remote != "" {
 		r.RemoteAddr = remote
 	}
@@ -226,7 +224,7 @@ func TestBusyIs503WithRetryAfterAndItsOwnMessage(t *testing.T) {
 	var logs syncBuffer
 	h := NewVMHandler(brokenVMs{session.ErrBusy}, slog.New(slog.NewTextHandler(&logs, nil)))
 	rec := httptest.NewRecorder()
-	h.Create(rec, httptest.NewRequest("POST", "/api/v1/playgrounds", nil), session.Owner{Hash: hashToken(tokenA)})
+	h.Create(rec, httptest.NewRequest("POST", "/api/v1/playgrounds", nil), session.Owner{UserID: userA})
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
@@ -280,10 +278,10 @@ func TestUnexpectedFailuresAre500AndLoggedNotShown(t *testing.T) {
 			var logs syncBuffer
 			h := NewVMHandler(brokenVMs{errors.New("disk on fire")}, slog.New(slog.NewTextHandler(&logs, nil)))
 			mux := http.NewServeMux()
-			vmRoutes(mux, h, 0)
+			vmRoutes(mux, h, fakeAuth{}, discard, 0)
 
 			r := httptest.NewRequest(tt.method, tt.path, nil)
-			r.Header.Set("Authorization", "Bearer "+tokenA)
+			withSession(r, tokenA)
 			rec := httptest.NewRecorder()
 			mux.ServeHTTP(rec, r)
 
@@ -303,7 +301,7 @@ func TestUnexpectedFailuresAre500AndLoggedNotShown(t *testing.T) {
 func TestNewVMHandlerWithoutLoggerDoesNotPanic(t *testing.T) {
 	h := NewVMHandler(brokenVMs{errors.New("boom")}, nil)
 	rec := httptest.NewRecorder()
-	h.Create(rec, httptest.NewRequest("POST", "/api/v1/playgrounds", nil), session.Owner{Hash: hashToken(tokenA)})
+	h.Create(rec, httptest.NewRequest("POST", "/api/v1/playgrounds", nil), session.Owner{UserID: userA})
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d", rec.Code)
 	}
@@ -328,7 +326,7 @@ func TestServerShutdownReachesTheTerminalHandler(t *testing.T) {
 func TestEveryRequestGetsItsOwnID(t *testing.T) {
 	a := newAPI(t, 2)
 	r := httptest.NewRequest("POST", "/api/v1/playgrounds", nil)
-	r.Header.Set("Authorization", "Bearer "+tokenA)
+	withSession(r, tokenA)
 	r.Header.Set("X-Request-ID", "client-chosen\nfake log line")
 	rec := httptest.NewRecorder()
 	a.srv.ServeHTTP(rec, r)
@@ -357,7 +355,7 @@ func TestReadyzReportsTheDependency(t *testing.T) {
 		brokenVMs
 		stubProvider
 	}{}
-	srv := NewServer(vms, func(context.Context) error { return down }, nil, RateLimits{}, nil)
+	srv := NewServer(vms, fakeAuth{}, func(context.Context) error { return down }, nil, RateLimits{}, nil)
 	get := func() int {
 		rec := httptest.NewRecorder()
 		srv.ServeHTTP(rec, httptest.NewRequest("GET", "/readyz", nil))

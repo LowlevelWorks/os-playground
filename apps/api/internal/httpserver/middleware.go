@@ -84,6 +84,32 @@ func requestID(next http.Handler) http.Handler {
 	})
 }
 
+// sameOriginWrites refuses a POST, PUT, PATCH or DELETE whose Origin is not
+// one of the web app's. The login cookie is SameSite=Lax, which already keeps
+// it off cross-site writes; this is the second, independent line against
+// CSRF, and it also covers sibling subdomains, which SameSite treats as the
+// same site. A request without Origin is not from a browser page (browsers
+// always send it on these methods), so it cannot be riding a user's cookie.
+func sameOriginWrites(allowed []string, next http.Handler) http.Handler {
+	set := make(map[string]struct{}, len(allowed))
+	for _, o := range allowed {
+		set[strings.ToLower(o)] = struct{}{}
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+		default:
+			if origin := r.Header.Get("Origin"); origin != "" {
+				if _, ok := set[strings.ToLower(origin)]; !ok {
+					writeError(w, http.StatusForbidden, "cross-origin request refused")
+					return
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // cors emits CORS headers for the REST endpoints. The frontend is a static
 // bundle served from a different origin (CloudFront in production, Next.js in
 // dev), so same-origin isn't available; browsers block the response body
@@ -99,6 +125,9 @@ func cors(allowed []string, next http.Handler) http.Handler {
 			if _, ok := set[strings.ToLower(origin)]; ok {
 				h := w.Header()
 				h.Set("Access-Control-Allow-Origin", origin)
+				// The login cookie rides on these requests (fetch with
+				// credentials: "include"), which only an exact origin may do.
+				h.Set("Access-Control-Allow-Credentials", "true")
 				h.Add("Vary", "Origin")
 				if r.Method == http.MethodOptions {
 					if m := r.Header.Get("Access-Control-Request-Method"); m != "" {

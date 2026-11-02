@@ -1,8 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ApiError, createApi } from "./api";
 
-const TOKEN = "T".repeat(43);
-
 const json = (body: unknown, init?: ResponseInit) =>
   new Response(JSON.stringify(body), {
     headers: { "Content-Type": "application/json" },
@@ -10,27 +8,24 @@ const json = (body: unknown, init?: ResponseInit) =>
   });
 
 describe("createApi", () => {
-  it("sends the owner token with every request", async () => {
-    const headers: Record<string, string>[] = [];
-    const api = createApi(
-      "/api",
-      async (_url, init) => {
-        headers.push(init?.headers as Record<string, string>);
-        return json({ id: "vm-1", status: "running", created_at: "" });
-      },
-      () => TOKEN,
-    );
+  it("sends the login cookie, and no token, with every request", async () => {
+    const inits: (RequestInit | undefined)[] = [];
+    const api = createApi("/api", async (_url, init) => {
+      inits.push(init);
+      return json({ id: "vm-1", status: "running", created_at: "" });
+    });
 
     await api.createVM();
     await api.getVM("vm-1");
     await api.deleteVM("vm-1");
 
-    expect(headers).toEqual(Array(3).fill({ Authorization: `Bearer ${TOKEN}` }));
+    expect(inits.map((i) => i?.credentials)).toEqual(["include", "include", "include"]);
+    expect(inits.map((i) => i?.headers)).toEqual([undefined, undefined, undefined]);
   });
 
   it("reads a quota refusal for a machine of this browser's", async () => {
     const api = createApi("/api", async () =>
-      json({ error: "quota", yours: true, id: "vm-7" }, { status: 409 }), () => TOKEN);
+      json({ error: "quota", yours: true, id: "vm-7" }, { status: 409 }));
 
     const err = await api.createVM().catch((e: unknown) => e);
 
@@ -39,7 +34,7 @@ describe("createApi", () => {
   });
 
   it("reads a quota refusal for someone else's machine", async () => {
-    const api = createApi("/api", async () => json({ error: "quota", yours: false }, { status: 409 }), () => TOKEN);
+    const api = createApi("/api", async () => json({ error: "quota", yours: false }, { status: 409 }));
 
     const err = await api.createVM().catch((e: unknown) => e);
 
@@ -47,7 +42,7 @@ describe("createApi", () => {
   });
 
   it("does not mistake another 409 for a quota refusal", async () => {
-    const api = createApi("/api", async () => json({ error: "conflict" }, { status: 409 }), () => TOKEN);
+    const api = createApi("/api", async () => json({ error: "conflict" }, { status: 409 }));
 
     const err = await api.createVM().catch((e: unknown) => e);
 

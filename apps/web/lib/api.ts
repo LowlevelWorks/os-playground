@@ -1,5 +1,3 @@
-import { getToken } from "./token";
-
 export type VMStatus =
   | "provisioning"
   | "starting"
@@ -16,8 +14,8 @@ export interface VM {
 }
 
 /**
- * Why a create was refused for being over the per-client limit. `yours` means
- * the machine in the way belongs to this browser; `id` is set once it exists.
+ * Why a create was refused for being over a limit. `yours` means the machine
+ * in the way belongs to the signed-in user; `id` is set once it exists.
  */
 export interface Quota {
   yours: boolean;
@@ -45,27 +43,31 @@ export interface Api {
   deleteVM(id: string, signal?: AbortSignal): Promise<void>;
 }
 
-type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
+export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
-export function createApi(
-  base = "/api",
-  fetchImpl: FetchLike = (input, init) => fetch(input, init),
-  token: () => string = getToken,
-): Api {
-  async function call(path: string, init: RequestInit): Promise<Response> {
+const defaultFetch: FetchLike = (input, init) => fetch(input, init);
+
+/**
+ * Calls the API with the login cookie. The cookie is HttpOnly, so no script
+ * can read it; `credentials: "include"` makes the browser send it even when
+ * the API is on another port, as in development.
+ */
+export function apiCall(base: string, fetchImpl: FetchLike = defaultFetch) {
+  return async function call(path: string, init: RequestInit): Promise<Response> {
     let res: Response;
     try {
-      res = await fetchImpl(base + path, {
-        ...init,
-        headers: { Authorization: `Bearer ${token()}` },
-      });
+      res = await fetchImpl(base + path, { ...init, credentials: "include" });
     } catch (err) {
       if (isAbort(err)) throw err;
       throw new ApiError(0, "Can't reach the server.");
     }
     if (!res.ok) throw await errorFrom(res);
     return res;
-  }
+  };
+}
+
+export function createApi(base = "/api", fetchImpl: FetchLike = defaultFetch): Api {
+  const call = apiCall(base, fetchImpl);
 
   return {
     async createVM(signal) {
