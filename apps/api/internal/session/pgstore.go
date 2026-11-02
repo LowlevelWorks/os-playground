@@ -497,3 +497,84 @@ func (p *PGStore) ReleaseAttach(ctx context.Context, id, holder string) error {
 	}
 	return nil
 }
+
+// PurgeDeletedSessions implements Store.PurgeDeletedSessions. One batch is
+// one short transaction under a try-lock; it uses the
+// sessions_deleted_by_terminated index.
+func (p *PGStore) PurgeDeletedSessions(ctx context.Context, olderThan time.Duration, limit int) (int, error) {
+	if err := checkPurge(ctx, olderThan, limit); err != nil {
+		return 0, err
+	}
+	var n int64
+	err := database.InTx(ctx, p.pool, func(tx pgx.Tx) error {
+		got, err := database.TryXactLock(ctx, tx, database.LockSessionPurge)
+		if err != nil {
+			return err
+		}
+		if !got {
+			return ErrBusy
+		}
+		tag, err := tx.Exec(ctx, `DELETE FROM playground_sessions
+			WHERE id IN (
+				SELECT id FROM playground_sessions
+				WHERE status = 'DELETED' AND terminated_at < now() - $1::interval
+				ORDER BY terminated_at
+				LIMIT $2)`, olderThan, limit)
+		if err != nil {
+			return fmt.Errorf("session: purge sessions: %w", err)
+		}
+		n = tag.RowsAffected()
+		return nil
+	})
+	return int(n), err
+}
+
+// PGAuditPurger is the PostgreSQL AuditPurger. Its pool must connect as a
+// member of playground_retention: each batch switches to that role, the only
+// one the audit trigger lets delete (see the retention_roles migration).
+type PGAuditPurger struct {
+	pool *pgxpool.Pool
+}
+
+var _ AuditPurger = (*PGAuditPurger)(nil)
+
+// NewPGAuditPurger returns a purger on pool.
+func NewPGAuditPurger(pool *pgxpool.Pool) (*PGAuditPurger, error) {
+	if pool == nil {
+		return nil, errors.New("session: PGAuditPurger needs a pool")
+	}
+	return &PGAuditPurger{pool: pool}, nil
+}
+
+// PurgeAuditEvents implements AuditPurger. IDs grow with time, so the oldest
+// events are found by id without another index.
+func (a *PGAuditPurger) PurgeAuditEvents(ctx context.Context, olderThan time.Duration, limit int) (int, error) {
+	if err := checkPurge(ctx, olderThan, limit); err != nil {
+		return 0, err
+	}
+	var n int64
+	err := database.InTx(ctx, a.pool, func(tx pgx.Tx) error {
+		got, err := database.TryXactLock(ctx, tx, database.LockAuditPurge)
+		if err != nil {
+			return err
+		}
+		if !got {
+			return ErrBusy
+		}
+		if _, err := tx.Exec(ctx, "SET LOCAL ROLE playground_retention"); err != nil {
+			return fmt.Errorf("session: purge audit: switch to the retention role: %w", err)
+		}
+		tag, err := tx.Exec(ctx, `DELETE FROM audit_events
+			WHERE id IN (
+				SELECT id FROM audit_events
+				WHERE occurred_at < now() - $1::interval
+				ORDER BY id
+				LIMIT $2)`, olderThan, limit)
+		if err != nil {
+			return fmt.Errorf("session: purge audit: %w", err)
+		}
+		n = tag.RowsAffected()
+		return nil
+	})
+	return int(n), err
+}

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -102,6 +103,12 @@ func run() error {
 		return err
 	}
 
+	retention, closeRetention, err := newRetention(dbCtx, cfg, store, log)
+	if err != nil {
+		return err
+	}
+	defer closeRetention()
+
 	// The reconciler is the only code that creates or deletes VMs (ADR 0010,
 	// section 2). Handlers only change rows, then wake it.
 	reconciler, err := session.NewReconciler(session.ReconcilerConfig{
@@ -160,10 +167,15 @@ func run() error {
 	// DELETE accepted during the drain is still acted on.
 	recCtx, stopReconciler := context.WithCancel(context.Background())
 	defer stopReconciler()
+	// The retention purge shares its context and its shutdown step: both are
+	// background database work that HTTP no longer needs once it has drained.
 	reconcilerDone := make(chan struct{})
 	go func() {
 		defer close(reconcilerDone)
-		reconciler.Run(recCtx)
+		var wg sync.WaitGroup
+		wg.Go(func() { reconciler.Run(recCtx) })
+		wg.Go(func() { retention.Run(recCtx) })
+		wg.Wait()
 	}()
 
 	serveErr := make(chan error, 1)
@@ -209,7 +221,7 @@ func shutdown(log *slog.Logger, api *httpserver.Server, srv *http.Server, provid
 
 	step("terminals", api.Shutdown)
 	step("http server", srv.Shutdown)
-	step("reconciler", func(ctx context.Context) error {
+	step("reconciler and retention", func(ctx context.Context) error {
 		stopReconciler()
 		select {
 		case <-reconcilerDone:
@@ -221,4 +233,41 @@ func shutdown(log *slog.Logger, api *httpserver.Server, srv *http.Server, provid
 	step("vm provider", provider.Close)
 
 	return errors.Join(errs...)
+}
+
+// newRetention builds the retention purge (ADR 0010, section 12). Audit
+// events need a connection that may become playground_retention; without
+// PLAYGROUND_RETENTION_DATABASE_URL they are kept, which is said loudly
+// because it means the retention policy is not being applied. The returned
+// func closes that connection pool.
+func newRetention(ctx context.Context, cfg config.Config, store session.Store, log *slog.Logger) (*session.Retention, func(), error) {
+	rcfg := session.RetentionConfig{
+		Sessions:         store,
+		SessionRetention: cfg.SessionRetention,
+		AuditRetention:   cfg.AuditRetention,
+		Logger:           log,
+	}
+	closePool := func() {}
+	if url := cfg.RetentionDatabaseURL.Reveal(); url != "" {
+		// Two connections: the purge runs one batch at a time.
+		rpool, err := database.New(ctx, url, 2)
+		if err != nil {
+			return nil, nil, fmt.Errorf("connect retention database: %w", err)
+		}
+		closePool = rpool.Close
+		purger, err := session.NewPGAuditPurger(rpool)
+		if err != nil {
+			rpool.Close()
+			return nil, nil, err
+		}
+		rcfg.Audit = purger
+	} else {
+		log.Warn("audit events are kept forever: set " + config.EnvRetentionDatabaseURL + " to apply the audit retention period")
+	}
+	r, err := session.NewRetention(rcfg)
+	if err != nil {
+		closePool()
+		return nil, nil, err
+	}
+	return r, closePool, nil
 }

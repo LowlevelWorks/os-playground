@@ -24,6 +24,23 @@ const nsSession int32 = 1
 // LockAdmission serialises session admission (ADR 0010, section 5).
 var LockAdmission = LockKey{nsSession, 1}
 
+// LockSessionPurge and LockAuditPurge let one replica at a time run each
+// retention purge. They are only ever tried, never waited for.
+var (
+	LockSessionPurge = LockKey{nsSession, 2}
+	LockAuditPurge   = LockKey{nsSession, 3}
+)
+
+// TryXactLock takes key for the rest of tx if it is free, and reports
+// whether it did. It never waits.
+func TryXactLock(ctx context.Context, tx pgx.Tx, key LockKey) (bool, error) {
+	var got bool
+	if err := tx.QueryRow(ctx, "SELECT pg_try_advisory_xact_lock($1, $2)", key.Namespace, key.ID).Scan(&got); err != nil {
+		return false, fmt.Errorf("try advisory lock %v: %w", key, err)
+	}
+	return got, nil
+}
+
 // InTx runs fn in one transaction: commit on nil, rollback on error or panic.
 func InTx(ctx context.Context, pool *pgxpool.Pool, fn func(pgx.Tx) error) error {
 	return pgx.BeginFunc(ctx, pool, fn)

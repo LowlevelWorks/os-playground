@@ -39,6 +39,10 @@ const (
 	EnvDatabaseURL       = "PLAYGROUND_DATABASE_URL"
 	EnvDBMaxConns        = "PLAYGROUND_DB_MAX_CONNS"
 	EnvAdmissionLockWait = "PLAYGROUND_ADMISSION_LOCK_WAIT"
+
+	EnvSessionRetention     = "PLAYGROUND_SESSION_RETENTION"
+	EnvAuditRetention       = "PLAYGROUND_AUDIT_RETENTION"
+	EnvRetentionDatabaseURL = "PLAYGROUND_RETENTION_DATABASE_URL"
 )
 
 const (
@@ -67,6 +71,13 @@ const (
 	// must be larger than the create burst the rate limiter lets through.
 	defaultDBMaxConns        = 10
 	defaultAdmissionLockWait = 2 * time.Second
+
+	// ADR 0010, section 12: DELETED sessions long enough to debug "my
+	// session vanished"; audit long enough to investigate an incident. A
+	// client's own retention policy overrides both.
+	defaultSessionRetention = 30 * 24 * time.Hour
+	defaultAuditRetention   = 90 * 24 * time.Hour
+	maxRetention            = 10 * 365 * 24 * time.Hour
 
 	maxVMMemoryMB = 4096
 	maxDBMaxConns = 1000
@@ -98,6 +109,16 @@ type Config struct {
 	// create waits for the admission lock before answering 503.
 	DBMaxConns        int
 	AdmissionLockWait time.Duration
+
+	// SessionRetention is how long a DELETED session row is kept;
+	// AuditRetention, an audit event. Go durations have no days: 720h is 30.
+	SessionRetention time.Duration
+	AuditRetention   time.Duration
+
+	// RetentionDatabaseURL connects as a member of playground_retention, the
+	// only role that may delete audit events. Empty means audit events are
+	// kept forever. A Secret, like DatabaseURL.
+	RetentionDatabaseURL Secret
 
 	ImagePath  string
 	QEMUBin    string
@@ -171,11 +192,15 @@ func Load(lookup Lookup) (Config, error) {
 
 		DBMaxConns:        l.intInRange(EnvDBMaxConns, defaultDBMaxConns, 1, maxDBMaxConns),
 		AdmissionLockWait: l.duration(EnvAdmissionLockWait, defaultAdmissionLockWait, maxLockWait),
+
+		SessionRetention: l.duration(EnvSessionRetention, defaultSessionRetention, maxRetention),
+		AuditRetention:   l.duration(EnvAuditRetention, defaultAuditRetention, maxRetention),
 	}
 
 	l.listenAddrs(&cfg)
 	cfg.AllowedOrigins = l.origins()
 	cfg.DatabaseURL = l.databaseURL()
+	cfg.RetentionDatabaseURL = l.optionalDatabaseURL(EnvRetentionDatabaseURL)
 	l.relations(cfg)
 
 	if len(l.errs) > 0 {
@@ -217,6 +242,19 @@ func (l *loader) databaseURL() Secret {
 	if err := validateDatabaseURL(raw); err != nil {
 		// The URL holds the password and this error is logged: never echo it.
 		l.fail(EnvDatabaseURL, redactURL(raw), err.Error())
+		return ""
+	}
+	return Secret(raw)
+}
+
+// optionalDatabaseURL is like databaseURL for a setting that may be empty.
+func (l *loader) optionalDatabaseURL(key string) Secret {
+	raw := l.str(key, "")
+	if raw == "" {
+		return ""
+	}
+	if err := validateDatabaseURL(raw); err != nil {
+		l.fail(key, redactURL(raw), err.Error())
 		return ""
 	}
 	return Secret(raw)
@@ -289,6 +327,9 @@ func (c Config) LogValue() slog.Value {
 		slog.Any("database", c.DatabaseURL),
 		slog.Int("db_max_conns", c.DBMaxConns),
 		slog.Duration("admission_lock_wait", c.AdmissionLockWait),
+		slog.Duration("session_retention", c.SessionRetention),
+		slog.Duration("audit_retention", c.AuditRetention),
+		slog.Any("retention_database", c.RetentionDatabaseURL),
 		slog.String("image", c.ImagePath),
 		slog.String("qemu", c.QEMUBin),
 		slog.String("qemu_accel", c.QEMUAccel),
